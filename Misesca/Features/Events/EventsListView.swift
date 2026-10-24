@@ -46,7 +46,7 @@ struct EventsListView: View {
                 }
             }
         }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
             switch result {
             case .success(let url):
                 do {

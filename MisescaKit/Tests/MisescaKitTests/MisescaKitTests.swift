@@ -62,7 +62,7 @@ final class LayoutLoaderTests: XCTestCase {
 
     func testNotJSON() {
         XCTAssertThrowsError(try LayoutLoader.load(Data("hello".utf8))) { e in
-            XCTAssertEqual((e as? LayoutError)?.message, "This file isn't valid JSON.")
+            XCTAssertEqual((e as? LayoutError)?.message, "This isn't a Misesca layout file. Layout files end in .json, like the samples.")
         }
     }
 

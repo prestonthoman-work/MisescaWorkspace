@@ -35,6 +35,18 @@ struct SettingsView: View {
                     }
                 }
 
+                if let sample = Bundle.main.url(forResource: "demo-room", withExtension: "json") {
+                    Section {
+                        ShareLink(item: sample) {
+                            Label("Save a sample layout file", systemImage: "square.and.arrow.up")
+                        }
+                    } header: {
+                        Text("Layout files")
+                    } footer: {
+                        Text("Layouts are .json files with the room size, two line-up points, and every table. Save the sample to Files to see the format or edit it for your room.")
+                    }
+                }
+
                 Section("Privacy") {
                     Text("Everything stays on this iPhone. The camera is used only in Set Mode, to find the floor and the tables. Misesca doesn't record video or look at people.")
                         .foregroundStyle(Palette.secondary)

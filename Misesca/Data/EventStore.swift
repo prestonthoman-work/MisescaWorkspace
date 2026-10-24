@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UniformTypeIdentifiers
 import MisescaKit
 
 /// All events on this iPhone. Saved as one JSON file in Application Support; nothing leaves the device.
@@ -72,6 +73,14 @@ final class EventStore {
     func importLayout(from url: URL) throws -> EventRecord {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let type = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType
+            ?? UTType(filenameExtension: url.pathExtension)
+        if let type, type.conforms(to: .image) || type.conforms(to: .movie) {
+            throw LayoutError("That's a photo, not a layout file. Misesca reads layout files that end in .json, like the samples. It can't read a picture of a floor plan.")
+        }
+        if let type, type.conforms(to: .pdf) {
+            throw LayoutError("That's a PDF. Misesca reads layout files that end in .json, like the samples. It can't read a PDF diagram.")
+        }
         let data: Data
         do {
             data = try Data(contentsOf: url)

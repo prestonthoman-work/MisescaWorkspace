@@ -118,7 +118,7 @@ public enum LayoutLoader {
             return "\(p) has the wrong kind of value. \(hint(for: ctx.codingPath.last))"
         case .dataCorrupted(let ctx):
             let p = path(ctx.codingPath)
-            if p.isEmpty { return "This file isn't valid JSON." }
+            if p.isEmpty { return "This isn't a Misesca layout file. Layout files end in .json, like the samples." }
             if ctx.codingPath.last?.stringValue == "type" {
                 return "\(p) isn't a known item type. Use round_table, banquet_table, stage, bar or dance_floor."
             }
