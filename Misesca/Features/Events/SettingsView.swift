@@ -40,10 +40,15 @@ struct SettingsView: View {
                         ShareLink(item: sample) {
                             Label("Save a sample layout file", systemImage: "square.and.arrow.up")
                         }
+                        if let diagram = Bundle.main.url(forResource: "harbor-diagram", withExtension: "png") {
+                            ShareLink(item: diagram) {
+                                Label("Save a sample diagram image", systemImage: "square.and.arrow.up")
+                            }
+                        }
                     } header: {
                         Text("Layout files")
                     } footer: {
-                        Text("Layouts are .json files with the room size, two line-up points, and every table. Save the sample to Files to see the format or edit it for your room.")
+                        Text("Import a .json layout file, or a diagram as an image or PDF. From a diagram you mark the room size and line-up points and check each table before saving.")
                     }
                 }
 

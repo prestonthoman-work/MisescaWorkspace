@@ -53,3 +53,14 @@ Feet, origin at the room's top-left corner in plan view, x to the right, y down 
 - `aisles[].label`: name used in results ("**Center aisle** is 4 ft. Plan calls for 6 ft.").
 
 Import a layout from the Events screen, or open a `.json` file with Misesca from Files or the share sheet.
+
+## Importing a diagram image or PDF
+
+Import also takes a PNG, JPG or PDF diagram, from Files or Photos. On device, Misesca traces table outlines and reads the table numbers (Apple Vision), then the user:
+
+1. Taps the room's top-left and bottom-right corners and enters the room width. Depth follows from the diagram's proportions.
+2. Checks the tables found: tap one to fix its number, type or size, or tap an empty spot to add one.
+3. Taps two line-up points (A and B) and names them.
+4. Enters event details and saves. The result is an ordinary layout.
+
+Works best on clean digital exports. Photos of paper taken at an angle aren't straightened, so expect to fix more by hand. Aisles aren't read from diagrams, so aisle widths aren't checked for those events. `Misesca/Resources/harbor-diagram.png` is a sample diagram (also in Settings) used by the tests.

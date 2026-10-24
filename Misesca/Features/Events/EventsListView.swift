@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 import MisescaKit
@@ -10,6 +11,9 @@ struct EventsListView: View {
     @State private var importError: String?
     @State private var showingSettings = false
     @State private var pendingDelete: EventRecord?
+    @State private var choosingPhoto = false
+    @State private var photoItem: PhotosPickerItem?
+    @State private var diagram: DiagramSource?
 
     var body: some View {
         Group {
@@ -41,19 +45,32 @@ struct EventsListView: View {
                 .accessibilityLabel("Settings")
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button { importing = true } label: {
-                    Label("Import layout", systemImage: "square.and.arrow.down")
+                Menu {
+                    Button { importing = true } label: {
+                        Label("Layout file or diagram", systemImage: "folder")
+                    }
+                    Button { choosingPhoto = true } label: {
+                        Label("Diagram from Photos", systemImage: "photo")
+                    }
+                } label: {
+                    Label("Import", systemImage: "square.and.arrow.down")
                 }
             }
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
             switch result {
             case .success(let url):
-                do {
-                    let record = try store.importLayout(from: url)
-                    path.append(record.id)
-                } catch {
-                    importError = error.localizedDescription
+                if DiagramSource.kind(of: url) == .layoutFile {
+                    do {
+                        let record = try store.importLayout(from: url)
+                        path.append(record.id)
+                    } catch {
+                        importError = error.localizedDescription
+                    }
+                } else if let source = DiagramSource.load(from: url) {
+                    diagram = source
+                } else {
+                    importError = "Couldn't open \(url.lastPathComponent)."
                 }
             case .failure:
                 importError = "Couldn't open that file."
@@ -78,6 +95,24 @@ struct EventsListView: View {
         } message: {
             Text("The layout, setup progress and check results will be removed from this iPhone.")
         }
+        .photosPicker(isPresented: $choosingPhoto, selection: $photoItem, matching: .images)
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            photoItem = nil
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self), let source = DiagramSource.load(imageData: data) {
+                    diagram = source
+                } else {
+                    importError = "Couldn't open that photo."
+                }
+            }
+        }
+        .fullScreenCover(item: $diagram) { source in
+            DiagramImportView(source: source) { layout in
+                let record = store.add(layout)
+                path.append(record.id)
+            }
+        }
         .sheet(isPresented: $showingSettings) {
             SettingsView()
         }
@@ -88,10 +123,10 @@ struct EventsListView: View {
             Text("No events on this iPhone")
                 .font(.heading(.title2))
                 .foregroundStyle(Palette.ink)
-            Text("Import a layout file from Files, or add the sample events to try a setup.")
+            Text("Import a layout file or a diagram image, or add the sample events to try a setup.")
                 .font(.body)
                 .foregroundStyle(Palette.secondary)
-            Button("Import layout") { importing = true }
+            Button("Import layout or diagram") { importing = true }
                 .buttonStyle(PrimaryButtonStyle())
                 .padding(.top, 8)
             Button("Add sample events") { store.restoreSamples() }
