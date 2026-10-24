@@ -1,0 +1,116 @@
+{
+  "event": {
+    "name": "Demo Room Lunch",
+    "room": "Demo Room",
+    "start": "2026-10-25T12:00:00-07:00",
+    "guests": 40
+  },
+  "room": {
+    "width_ft": 30,
+    "depth_ft": 25
+  },
+  "reference_points": {
+    "A": {
+      "x": 15,
+      "y": 2,
+      "label": "Front wall, center",
+      "name": "front wall"
+    },
+    "B": {
+      "x": 15,
+      "y": 24,
+      "label": "Back door, center",
+      "name": "back door"
+    }
+  },
+  "items": [
+    {
+      "id": "T1",
+      "type": "banquet_table",
+      "label": "1",
+      "x": 6,
+      "y": 7,
+      "length_ft": 6,
+      "width_ft": 2.5,
+      "rotation": 0,
+      "seats": 6
+    },
+    {
+      "id": "T2",
+      "type": "banquet_table",
+      "label": "2",
+      "x": 15,
+      "y": 7,
+      "length_ft": 6,
+      "width_ft": 2.5,
+      "rotation": 0,
+      "seats": 6
+    },
+    {
+      "id": "T3",
+      "type": "banquet_table",
+      "label": "3",
+      "x": 24,
+      "y": 7,
+      "length_ft": 6,
+      "width_ft": 2.5,
+      "rotation": 0,
+      "seats": 6
+    },
+    {
+      "id": "T4",
+      "type": "round_table",
+      "label": "4",
+      "x": 7,
+      "y": 15,
+      "diameter_ft": 5,
+      "seats": 8
+    },
+    {
+      "id": "T5",
+      "type": "round_table",
+      "label": "5",
+      "x": 23,
+      "y": 15,
+      "diameter_ft": 5,
+      "seats": 8
+    },
+    {
+      "id": "T6",
+      "type": "banquet_table",
+      "label": "6",
+      "x": 7,
+      "y": 21,
+      "length_ft": 6,
+      "width_ft": 2.5,
+      "rotation": 0,
+      "seats": 3
+    },
+    {
+      "id": "T7",
+      "type": "banquet_table",
+      "label": "7",
+      "x": 23,
+      "y": 21,
+      "length_ft": 6,
+      "width_ft": 2.5,
+      "rotation": 0,
+      "seats": 3
+    }
+  ],
+  "aisles": [
+    {
+      "id": "AISLE-CENTER",
+      "label": "Center aisle",
+      "from": {
+        "x": 15,
+        "y": 10
+      },
+      "to": {
+        "x": 15,
+        "y": 24
+      },
+      "min_width_ft": 5
+    }
+  ]
+}
