@@ -56,11 +56,33 @@ Import a layout from the Events screen, or open a `.json` file with Misesca from
 
 ## Importing a diagram image or PDF
 
-Import also takes a PNG, JPG or PDF diagram, from Files or Photos. On device, Misesca traces table outlines and reads the table numbers (Apple Vision), then the user:
+Import also takes a PNG, JPG or PDF diagram, from Files or Photos, including a phone photo of a printout. Everything runs on the phone.
 
-1. Taps the room's top-left and bottom-right corners and enters the room width. Depth follows from the diagram's proportions.
-2. Checks the tables found: tap one to fix its number, type or size, or tap an empty spot to add one.
-3. Taps two line-up points (A and B) and names them.
-4. Enters event details and saves. The result is an ordinary layout.
+1. **Corners.** The room's corners are found automatically. Drag any that are off (a magnifier shows the spot); on release they snap onto the walls, or the page edges in a photo. Each side is measured along its length to a fraction of a pixel and fitted with a straight line.
+2. **Size.** Either "round tables are 60 in" (or 66 / 72), which works on diagrams with no dimensions, or the room's width and depth, which is the most accurate.
+3. **Reading.** The image is straightened (perspective corrected), tables are found from the enclosed shapes in the drawing, each edge is measured to a fraction of a pixel, and table numbers are read inside each table.
+4. **Review.** Tables are shown on the straightened diagram with the room size. Numbers that couldn't be read are gray with a "?". Tap to fix, add or remove.
+5. **Line-up points and details**, then save as a normal layout.
 
-Works best on clean digital exports. Photos of paper taken at an angle aren't straightened, so expect to fix more by hand. Aisles aren't read from diagrams, so aisle widths aren't checked for those events. `Misesca/Resources/harbor-diagram.png` is a sample diagram (also in Settings) used by the tests.
+### Measured accuracy
+
+From `MisescaKit/Tests/MisescaKitTests/DiagramAccuracyTests.swift`. Known layouts are drawn in four styles (outlines, chairs around tables, filled tables, faint gray lines). Simulated phone photos add tilt, blur, sensor noise, uneven light and JPEG compression. Every table is compared with the truth.
+
+| Input | Tables found | False tables | Center error (mean / worst) | Numbers read |
+|---|---|---|---|---|
+| Clean exports, all styles | 100% | 0 | ≤ 0.07 ft / ≤ 0.12 ft | 100% |
+| Phone photos, outline and chair styles | 100% | 0 | ≤ 0.11 ft / ≤ 0.24 ft | 96–100% |
+| Phone photos, faint gray lines | 58–100% | 0 | up to 0.39 ft / 0.73 ft | most |
+
+- Faint-line photos are the hard case. The app shows a warning when the tables measure inconsistently, and that warning appeared on every faint-photo test and never on a good image.
+- Corners dragged up to 21 px off are pulled back to within 1 px.
+- On real venue diagrams (Vail Recreation District sample layouts), the dance floor labeled 16' × 16' measures 16.0 × 16.0 ft with the scale taken from the 60" rounds.
+
+### Limits
+
+- Aisles aren't read from diagrams, so aisle widths aren't checked for those events.
+- Decorative circles (plants) can be mistaken for rounds on plans with no tables. The room size shown at review, plus a warning when it's implausible, flags this.
+- Architectural pieces drawn as filled rectangles (columns, wall stubs) can be read as tables. They're visible at review and can be removed.
+- Accuracy depends on the diagram being drawn to scale. A 60" round drawn at the wrong size makes everything off by the same proportion. Entering the room size avoids that.
+
+`Misesca/Resources/harbor-diagram.png` is a sample diagram (also in Settings).

@@ -8,23 +8,31 @@ import MisescaKit
 @MainActor
 @Observable
 final class DiagramImportModel {
-    enum Step { case room, tables, points, details }
+    enum Step { case corners, scale, reading, tables, points, details }
+    enum ScaleChoice: Hashable { case rounds, room }
 
     let source: DiagramSource
-    var step: Step = .room
-    /// Reading runs while the person marks the room, so they rarely wait.
-    private(set) var isReading = true
-    var waitingToConfirm = false
+    var step: Step = .corners
 
-    // Room
-    var topLeft: PlanPoint?
-    var bottomRight: PlanPoint?
+    // Corners, in source image pixels: top-left, top-right, bottom-right, bottom-left.
+    var corners: [PlanPoint] = []
+    private(set) var findingCorners = true
+    private(set) var tightening = false
+
+    // Scale
+    var scaleChoice: ScaleChoice = .rounds
+    var roundInches: Double = 60
     var widthText = ""
+    var depthText = ""
+    var readError: String?
 
-    // Tables, in plan feet
+    // What was read, on the straightened image. Plan coordinates map onto it directly.
+    private(set) var result: DiagramResult?
+    private(set) var straightened: UIImage?
     var items: [LayoutItem] = []
+    var guessed: Set<String> = []
     var selectedID: String?
-    var foundCount = 0
+    private(set) var foundCount = 0
 
     // Line-up points, in plan feet
     var pointA: PlanPoint?
@@ -39,72 +47,109 @@ final class DiagramImportModel {
     var date = Date()
     var guestsText = ""
 
-    @ObservationIgnored private var reading: DiagramReading?
     @ObservationIgnored private var addedCount = 0
 
     init(source: DiagramSource) {
         self.source = source
         eventName = source.suggestedName
+        let w = Double(source.image.size.width), h = Double(source.image.size.height)
+        let inset = 0.06
+        corners = [PlanPoint(x: w * inset, y: h * inset), PlanPoint(x: w * (1 - inset), y: h * inset),
+                   PlanPoint(x: w * (1 - inset), y: h * (1 - inset)), PlanPoint(x: w * inset, y: h * (1 - inset))]
     }
 
-    var imageSize: CGSize { source.image.size }
-
-    func read() async {
-        guard reading == nil else { return }
-        let empty = DiagramReading(imageWidth: Double(imageSize.width), imageHeight: Double(imageSize.height), shapes: [], texts: [])
-        if let cg = source.image.cgImage {
-            // If tracing fails, the person can still mark everything by hand.
-            reading = (try? await Task.detached(priority: .userInitiated) { try DiagramReader.read(cg) }.value) ?? empty
-        } else {
-            reading = empty
+    /// The image the current step draws on.
+    var displayImage: UIImage {
+        switch step {
+        case .corners, .scale, .reading: return source.image
+        default: return straightened ?? source.image
         }
-        isReading = false
-        if waitingToConfirm { confirmRoom() }
     }
 
-    // MARK: Room
+    var calibration: DiagramCalibration? { result?.calibration }
 
-    var widthFt: Double? {
-        guard let v = Double(widthText.replacingOccurrences(of: ",", with: ".")), v > 0, v <= 1000 else { return nil }
+    // MARK: Corners
+
+    func findCorners() async {
+        guard let cg = source.image.cgImage else { findingCorners = false; return }
+        let found = await Task.detached(priority: .userInitiated) { DiagramCorners.detect(in: cg) }.value
+        if let found, found.count == 4 { corners = found }
+        findingCorners = false
+    }
+
+    func moveCorner(_ index: Int, to p: PlanPoint) {
+        let w = Double(source.image.size.width), h = Double(source.image.size.height)
+        corners[index] = PlanPoint(x: min(max(0, p.x), w), y: min(max(0, p.y), h))
+    }
+
+    /// Snaps the corners onto the walls (or page edges) next to where they were dropped.
+    func tightenCorners() async {
+        guard let cg = source.image.cgImage else { return }
+        tightening = true
+        let given = corners
+        let tightened = await Task.detached(priority: .userInitiated) { DiagramCorners.refine(given, in: cg) }.value
+        // Only take it if nothing moved in the meantime.
+        if corners == given { corners = tightened }
+        tightening = false
+    }
+
+    // MARK: Scale and reading
+
+    var widthFt: Double? { Self.feet(widthText) }
+    var depthFt: Double? { Self.feet(depthText) }
+
+    static func feet(_ text: String) -> Double? {
+        guard let v = Double(text.replacingOccurrences(of: ",", with: ".")), v >= 5, v <= 1000 else { return nil }
         return v
     }
 
-    var calibration: DiagramCalibration? {
-        guard let tl = topLeft, let br = bottomRight, let w = widthFt else { return nil }
-        let c = DiagramCalibration(topLeft: tl, bottomRight: br, widthFt: w)
-        return c.isValid ? c : nil
-    }
-
-    func tapRoom(at pixel: PlanPoint) {
-        if topLeft == nil {
-            topLeft = pixel
-        } else if bottomRight == nil {
-            guard pixel.x > topLeft!.x + 10, pixel.y > topLeft!.y + 10 else { return }
-            bottomRight = pixel
+    var canRead: Bool {
+        switch scaleChoice {
+        case .rounds: return true
+        case .room: return widthFt != nil && depthFt != nil
         }
     }
 
-    func redoCorners() {
-        topLeft = nil
-        bottomRight = nil
+    func read() async {
+        guard let cg = source.image.cgImage else { readError = "Couldn't read this image."; return }
+        let scale: DiagramSetup.Scale
+        switch scaleChoice {
+        case .rounds: scale = .roundDiameter(roundInches / 12)
+        case .room:
+            guard let w = widthFt, let d = depthFt else { return }
+            scale = .roomSize(widthFt: w, depthFt: d)
+        }
+        readError = nil
+        step = .reading
+        let setup = DiagramSetup(corners: corners, scale: scale)
+        do {
+            let r = try await Task.detached(priority: .userInitiated) { try DiagramPipeline.run(cg, setup: setup) }.value
+            result = r
+            straightened = UIImage(cgImage: r.image)
+            corners = r.corners
+            items = r.items
+            guessed = r.guessedLabels
+            foundCount = r.items.filter(\.type.isTable).count
+            selectedID = nil
+            pointA = nil
+            pointB = nil
+            step = .tables
+        } catch DiagramError.noRoundsToSizeFrom {
+            readError = DiagramError.noRoundsToSizeFrom.errorDescription
+            scaleChoice = .room
+            step = .scale
+        } catch {
+            readError = error.localizedDescription
+            step = .scale
+        }
     }
 
-    func confirmRoom() {
-        guard let cal = calibration else { return }
-        guard let reading else {
-            waitingToConfirm = true
-            return
-        }
-        waitingToConfirm = false
-        items = DiagramLayoutBuilder.items(from: reading, calibration: cal)
-        foundCount = items.filter { $0.type.isTable }.count
-        selectedID = nil
-        step = .tables
-    }
+    var warnings: [String] { result?.warnings ?? [] }
 
     // MARK: Tables
 
     var tableCount: Int { items.filter { $0.type.isTable }.count }
+    var guessedCount: Int { items.filter { guessed.contains($0.id) }.count }
 
     func tapTables(at plan: PlanPoint) {
         let hits = items.filter { $0.footprint.inflated(by: 1).contains(plan) }
@@ -121,7 +166,8 @@ final class DiagramImportModel {
         let label = nextLabel()
         addedCount += 1
         let item = LayoutItem(id: "NEW\(addedCount)", type: .roundTable, label: label, x: plan.x, y: plan.y,
-                              diameterFt: 5, seats: DiagramLayoutBuilder.defaultSeats(.roundTable, length: 5))
+                              diameterFt: roundInches / 12,
+                              seats: DiagramLayoutBuilder.defaultSeats(.roundTable, length: roundInches / 12))
         items.append(item)
         selectedID = item.id
     }
@@ -137,6 +183,7 @@ final class DiagramImportModel {
         get { items.first { $0.id == selectedID } }
         set {
             guard let newValue, let i = items.firstIndex(where: { $0.id == newValue.id }) else { return }
+            if items[i].label != newValue.label { guessed.remove(newValue.id) }
             items[i] = newValue
         }
     }

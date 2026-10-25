@@ -10,54 +10,24 @@ final class DiagramTests: XCTestCase {
         return try XCTUnwrap(CGImageSourceCreateImageAtIndex(src, 0, nil))
     }
 
-    /// The bundled sample diagram is the Harbor layout drawn at 14 px per foot,
-    /// with the room's corners at (60, 110) and (1320, 1090).
-    func testReadsHarborDiagram() throws {
+    /// The bundled sample diagram (also offered in Settings) is the Harbor layout drawn at 14 px
+    /// per foot. Found with no help: room corners, then every table, by the 60 in rounds.
+    func testReadsBundledSampleDiagram() throws {
         let truth = try LayoutLoader.load(Data(contentsOf: LayoutLoaderTests.resources.appendingPathComponent("harbor-room-gala.json")))
-        let reading = try DiagramReader.read(loadImage("harbor-diagram.png"))
-        let cal = DiagramCalibration(topLeft: PlanPoint(x: 60, y: 110), bottomRight: PlanPoint(x: 1320, y: 1090), widthFt: 90)
-        XCTAssertEqual(cal.depthFt, 70, accuracy: 0.01)
-
-        let items = DiagramLayoutBuilder.items(from: reading, calibration: cal)
-        let rounds = items.filter { $0.type == .roundTable }
-        XCTAssertEqual(rounds.count, 30, "found \(items.map { "\($0.label ?? "?")@\(Int($0.x)),\(Int($0.y))" })")
-
-        var labelled = 0
-        for t in truth.items where t.type == .roundTable {
-            guard let match = rounds.min(by: { $0.center.distance(to: t.center) < $1.center.distance(to: t.center) }) else { continue }
-            XCTAssertLessThan(match.center.distance(to: t.center), 0.5, "\(t.id)")
-            XCTAssertEqual(match.diameterFt ?? 0, 5, accuracy: 0.5)
-            if match.label == t.label { labelled += 1 }
-        }
-        XCTAssertEqual(labelled, 30, "table numbers read correctly")
-
-        let gift = items.first { $0.type == .banquetTable && $0.center.distance(to: PlanPoint(x: 68, y: 66)) < 1 }
+        let image = try loadImage("harbor-diagram.png")
+        let corners = try XCTUnwrap(DiagramCorners.detect(in: image))
+        let result = try DiagramPipeline.run(image, setup: DiagramSetup(corners: corners, scale: .roundDiameter(5)))
+        XCTAssertEqual(result.calibration.widthFt, 90, accuracy: 0.2)
+        XCTAssertEqual(result.calibration.depthFt, 70, accuracy: 0.2)
+        let score = DiagramAccuracyTests.score("bundled sample", truth: truth, got: result.items)
+        XCTAssertEqual(score.found, truth.tables.count)
+        XCTAssertEqual(score.extras, 0)
+        XCTAssertLessThanOrEqual(score.maxError, 0.15)
+        XCTAssertEqual(score.labelsRight, truth.tables.count)
+        let gift = result.items.first { $0.type == .banquetTable && $0.center.distance(to: PlanPoint(x: 68, y: 66)) < 1 }
         XCTAssertEqual(gift?.label, "Gift table")
-        XCTAssertNotNil(items.first { $0.type == .bar }, "bar")
-        XCTAssertNotNil(items.first { $0.type == .stage }, "stage")
-    }
-
-    func testReadsLowResolutionExport() throws {
-        // The same diagram at 60% size, like a compressed export or a screenshot.
-        let full = try loadImage("harbor-diagram.png")
-        let w = Int(Double(full.width) * 0.6), h = Int(Double(full.height) * 0.6)
-        let ctx = try XCTUnwrap(CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                                          space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
-        ctx.interpolationQuality = .medium
-        ctx.draw(full, in: CGRect(x: 0, y: 0, width: w, height: h))
-        let small = try XCTUnwrap(ctx.makeImage())
-
-        let reading = try DiagramReader.read(small)
-        let cal = DiagramCalibration(topLeft: PlanPoint(x: 36, y: 66), bottomRight: PlanPoint(x: 792, y: 654), widthFt: 90)
-        let items = DiagramLayoutBuilder.items(from: reading, calibration: cal)
-        let rounds = items.filter { $0.type == .roundTable }
-        XCTAssertEqual(rounds.count, 30)
-        let truth = try LayoutLoader.load(Data(contentsOf: LayoutLoaderTests.resources.appendingPathComponent("harbor-room-gala.json")))
-        let labelled = truth.items.filter { t in
-            t.type == .roundTable && rounds.contains { $0.label == t.label && $0.center.distance(to: t.center) < 0.75 }
-        }.count
-        // Currently 26 of 30. The review screen exists to fix the rest.
-        XCTAssertGreaterThanOrEqual(labelled, 25, "table numbers read correctly at low resolution")
+        XCTAssertNotNil(result.items.first { $0.type == .bar }, "bar")
+        XCTAssertNotNil(result.items.first { $0.type == .stage }, "stage")
     }
 
     func testClassifiesCircleAndRotatedRectangle() {

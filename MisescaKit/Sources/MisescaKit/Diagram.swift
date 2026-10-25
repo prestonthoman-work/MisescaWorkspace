@@ -3,10 +3,10 @@ import CoreGraphics
 
 /// A table-like shape found in a diagram image. Units are image pixels, y down.
 public struct DiagramShape: Hashable, Sendable {
-    public enum Kind: String, Sendable { case circle, rectangle }
+    public enum Kind: String, Sendable { case circle, ellipse, rectangle }
     public var kind: Kind
     public var center: PlanPoint
-    /// Diameter for circles, long side for rectangles.
+    /// Diameter for circles, long axis for ellipses, long side for rectangles.
     public var length: Double
     public var width: Double
     public var rotationDegrees: Double
@@ -45,29 +45,77 @@ public struct DiagramReading: Sendable {
     }
 }
 
-/// Ties image pixels to feet. The user taps the room's top-left and bottom-right corners
-/// and enters the room width; diagrams are drawn to one scale, so the depth follows.
+/// Ties image pixels to feet. The room's top-left and bottom-right corners bound the room;
+/// the scale comes from a known room width or a known table size.
 public struct DiagramCalibration: Hashable, Sendable {
     public var topLeft: PlanPoint
     public var bottomRight: PlanPoint
-    public var widthFt: Double
+    public var feetPerPixel: Double
 
-    public init(topLeft: PlanPoint, bottomRight: PlanPoint, widthFt: Double) {
+    public init(topLeft: PlanPoint, bottomRight: PlanPoint, feetPerPixel: Double) {
         self.topLeft = topLeft
         self.bottomRight = bottomRight
-        self.widthFt = widthFt
+        self.feetPerPixel = feetPerPixel
+    }
+
+    public init(topLeft: PlanPoint, bottomRight: PlanPoint, widthFt: Double) {
+        self.init(topLeft: topLeft, bottomRight: bottomRight, feetPerPixel: widthFt / max(bottomRight.x - topLeft.x, 1e-9))
     }
 
     public var isValid: Bool {
-        bottomRight.x - topLeft.x > 10 && bottomRight.y - topLeft.y > 10 && widthFt > 0
+        bottomRight.x - topLeft.x > 10 && bottomRight.y - topLeft.y > 10 && feetPerPixel > 0
     }
 
-    public var feetPerPixel: Double { widthFt / (bottomRight.x - topLeft.x) }
+    public var widthFt: Double { (bottomRight.x - topLeft.x) * feetPerPixel }
     public var depthFt: Double { (bottomRight.y - topLeft.y) * feetPerPixel }
     public var room: RoomSize { RoomSize(widthFt: widthFt, depthFt: depthFt) }
 
     public func plan(_ pixel: PlanPoint) -> PlanPoint { (pixel - topLeft) * feetPerPixel }
     public func pixel(_ plan: PlanPoint) -> PlanPoint { topLeft + plan * (1 / feetPerPixel) }
+}
+
+public enum DiagramScale {
+    /// The drawn diameter, in pixels, shared by the most round tables. Diagrams use one or two
+    /// standard sizes, so the biggest cluster is the house round. Nil when there are fewer than three.
+    public static func typicalRoundDiameter(in reading: DiagramReading) -> Double? {
+        typicalRound(in: reading.shapes)?.diameter
+    }
+
+    /// The house round: the largest drawn size that at least three round shapes share.
+    /// Chairs are smaller and more numerous, cocktail tables smaller, so size wins over count.
+    /// Also returns how oval those rounds came out (horizontal over vertical extent), which
+    /// tells how far a straightened photo's proportions are off.
+    public static func typicalRound(in shapes: [DiagramShape]) -> (diameter: Double, stretch: Double, spread: Double)? {
+        let round = shapes.filter { s in
+            s.kind == .circle || (s.kind == .ellipse && s.length / max(s.width, 1e-9) < 1.6)
+        }.sorted { $0.length > $1.length }
+        var outer: [DiagramShape] = []
+        for c in round where !outer.contains(where: { $0.center.distance(to: c.center) < $0.width / 2 }) {
+            outer.append(c)
+        }
+        func size(_ s: DiagramShape) -> Double { (s.length + s.width) / 2 }
+        let candidates = outer.filter { size($0) >= 12 }
+        func median(_ c: [DiagramShape]) -> Double { let v = c.map(size).sorted(); return v[v.count / 2] }
+        let clusters = candidates
+            .map { x in candidates.filter { abs(size($0) - size(x)) <= size(x) * 0.1 } }
+            .filter { $0.count >= 3 }
+        guard let largest = clusters.map(median).max() else { return nil }
+        let best = clusters.filter { median($0) >= largest * 0.9 }.max { $0.count < $1.count } ?? []
+        guard best.count >= 3 else { return nil }
+        let stretches = best.map { s -> Double in
+            guard s.kind == .ellipse else { return 1 }
+            let a = s.length / 2, b = s.width / 2, t = s.rotationDegrees * .pi / 180
+            let hx = (a * a * cos(t) * cos(t) + b * b * sin(t) * sin(t)).squareRoot()
+            let vy = (a * a * sin(t) * sin(t) + b * b * cos(t) * cos(t)).squareRoot()
+            return hx / vy
+        }.sorted()
+        // Diameter as if circular: the geometric mean of the axes keeps area.
+        let diameters = best.map { ($0.length * $0.width).squareRoot() }.sorted()
+        let median = diameters[diameters.count / 2]
+        // How much same-size tables disagree: the middle half's range relative to the size.
+        let spread = (diameters[diameters.count * 3 / 4] - diameters[diameters.count / 4]) / median
+        return (median, stretches[stretches.count / 2], spread)
+    }
 }
 
 /// Classifies one traced outline as a circle or rectangle, or neither.
@@ -165,10 +213,15 @@ public enum ShapeClassifier {
 public enum DiagramLayoutBuilder {
     /// Plausible table sizes, in feet.
     static let roundDiameter = 2.5...8.0
-    static let banquetLength = 3.5...12.0
+    static let banquetLength = 3.5...16.0
     static let banquetWidth = 1.5...4.0
 
     public static func items(from reading: DiagramReading, calibration: DiagramCalibration) -> [LayoutItem] {
+        itemsAndGuesses(from: reading, calibration: calibration).items
+    }
+
+    /// Items, plus the ids of tables whose numbers couldn't be read and were filled in.
+    public static func itemsAndGuesses(from reading: DiagramReading, calibration: DiagramCalibration) -> (items: [LayoutItem], guessed: Set<String>) {
         let fpp = calibration.feetPerPixel
         let room = calibration.room
 
@@ -178,6 +231,15 @@ public enum DiagramLayoutBuilder {
             let center = calibration.plan(s.center)
             guard room.contains(center) else { continue }
             let length = s.length * fpp, width = s.width * fpp
+            // A slightly oval round is still a round; straightening leaves a little error.
+            let roundish = s.kind == .circle || (s.kind == .ellipse && length / width < 1.12)
+            if roundish {
+                let d = (length + width) / 2
+                if roundDiameter.contains(d) {
+                    found.append((.roundTable, Footprint(center: center, length: d, width: d, rotationDegrees: 0)))
+                }
+                continue
+            }
             switch s.kind {
             case .circle where roundDiameter.contains(length):
                 found.append((.roundTable, Footprint(center: center, length: length, width: length, rotationDegrees: 0)))
@@ -200,6 +262,7 @@ public enum DiagramLayoutBuilder {
                 let lower = w.lowercased()
                 if lower.contains("stage") { named.append((.stage, w, f)); break }
                 if lower.contains("bar") { named.append((.bar, w, f)); break }
+                if lower.contains("dance") { named.append((.danceFloor, w, f)); break }
             }
         }
         // A named piece wins over a table guess on the same spot.
@@ -221,7 +284,7 @@ public enum DiagramLayoutBuilder {
         // Labels: short text sitting on or right next to the table.
         let texts = reading.texts.compactMap { t -> (String, PlanPoint)? in
             let s = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !s.isEmpty, s.count <= 20 else { return nil }
+            guard isPlausibleLabel(s) else { return nil }
             return (s, calibration.plan(t.center))
         }
         var usedLabels = Set<String>()
@@ -234,7 +297,8 @@ public enum DiagramLayoutBuilder {
             return label
         }
         // Tables without a readable number get the next free numbers.
-        var next = (usedLabels.compactMap(Int.init).max() ?? 0) + 1
+        var next = (usedLabels.compactMap(Int.init).filter { $0 <= 999 }.max() ?? 0) + 1
+        let guessedIndices = Set(labels.indices.filter { labels[$0] == nil })
         for i in labels.indices where labels[i] == nil {
             while usedLabels.contains(String(next)) { next += 1 }
             labels[i] = String(next)
@@ -249,15 +313,17 @@ public enum DiagramLayoutBuilder {
             keptNamed.append(n)
         }
         for (type, word, f) in keptNamed {
-            var id = type == .stage ? "STAGE" : "BAR"
+            let base = type == .stage ? "STAGE" : (type == .bar ? "BAR" : "DANCE")
+            var id = base
             var k = 2
-            while ids.contains(id) { id = (type == .stage ? "STAGE" : "BAR") + "\(k)"; k += 1 }
+            while ids.contains(id) { id = base + "\(k)"; k += 1 }
             ids.insert(id)
             pieces.append(LayoutItem(id: id, type: type, label: word, x: f.center.x, y: f.center.y,
                                      lengthFt: (f.length * 2).rounded() / 2, widthFt: (f.width * 2).rounded() / 2,
                                      rotation: f.rotationDegrees.rounded()))
         }
-        return pieces + kept.enumerated().map { i, k in
+        var guessedIDs = Set<String>()
+        let tables = kept.enumerated().map { i, k -> LayoutItem in
             let label = labels[i] ?? String(i + 1)
             var id = "T\(label)".replacingOccurrences(of: " ", with: "-")
             if ids.contains(id) { id += "-\(i + 1)" }
@@ -269,10 +335,36 @@ public enum DiagramLayoutBuilder {
                                   diameterFt: d, seats: defaultSeats(.roundTable, length: d))
             }
             let l = (f.length * 2).rounded() / 2, w = (f.width * 2).rounded() / 2
+            // A table-sized piece named on the diagram as a bar is a bar.
+            let lower = label.lowercased()
+            if lower.contains("bar") || lower.contains("stage") {
+                let type: ItemType = lower.contains("bar") ? .bar : .stage
+                return LayoutItem(id: id, type: type, label: label, x: f.center.x, y: f.center.y,
+                                  lengthFt: l, widthFt: w, rotation: f.rotationDegrees.rounded())
+            }
             return LayoutItem(id: id, type: .banquetTable, label: label, x: f.center.x, y: f.center.y,
                               lengthFt: l, widthFt: w, rotation: f.rotationDegrees.rounded(),
                               seats: defaultSeats(.banquetTable, length: l))
         }
+        for (i, item) in tables.enumerated() where guessedIndices.contains(i) { guessedIDs.insert(item.id) }
+        return (pieces + tables, guessedIDs)
+    }
+
+    /// Table numbers run 1 to 999 without leading zeros; names are words. Anything else is
+    /// more likely chairs or line work read as text, and is left for the person to fill in.
+    static func isPlausibleLabel(_ s: String) -> Bool {
+        guard !s.isEmpty, s.count <= 20 else { return false }
+        if s.allSatisfy(\.isNumber) {
+            guard let n = Int(s), n >= 1, n <= 999, !s.hasPrefix("0") else { return false }
+            return true
+        }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -'&#./"))
+        guard s.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return false }
+        let letters = s.filter(\.isLetter)
+        guard letters.count >= 2 else { return false }
+        // "oo oo do oo": mostly round letters is a row of chairs, not a word.
+        let round = letters.lowercased().filter { "o0".contains($0) }.count
+        return Double(round) / Double(letters.count) < 0.5
     }
 
     /// Common seating: 60 in rounds seat 8, 72 in rounds seat 10, banquet tables about one per foot.

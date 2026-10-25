@@ -8,7 +8,8 @@ let package = Package(
         .library(name: "MisescaKit", targets: ["MisescaKit"])
     ],
     targets: [
-        .target(name: "MisescaKit"),
+        // Reading diagrams is heavy pixel work; keep it optimized even in Debug builds run from Xcode.
+        .target(name: "MisescaKit", swiftSettings: [.unsafeFlags(["-O"], .when(configuration: .debug))]),
         .testTarget(name: "MisescaKitTests", dependencies: ["MisescaKit"])
     ]
 )

@@ -1,7 +1,7 @@
 import SwiftUI
 import MisescaKit
 
-/// Builds a layout from a diagram image: room size, tables, line-up points, then details.
+/// Builds a layout from a diagram image: corners, size, tables, line-up points, then details.
 struct DiagramImportView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var model: DiagramImportModel
@@ -31,7 +31,7 @@ struct DiagramImportView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Cancel") { dismiss() }
                 }
-                if model.step != .room {
+                if model.step != .corners && model.step != .reading {
                     ToolbarItem(placement: .topBarLeading) {
                         Button("Back", action: back)
                     }
@@ -39,7 +39,7 @@ struct DiagramImportView: View {
             }
             .toolbar(.visible, for: .navigationBar)
             .tint(Palette.brass)
-            .task { await model.read() }
+            .task { await model.findCorners() }
             .alert("Can't save yet", isPresented: Binding(get: { saveError != nil }, set: { if !$0 { saveError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {
@@ -50,7 +50,9 @@ struct DiagramImportView: View {
 
     private var title: String {
         switch model.step {
-        case .room: return "Room size"
+        case .corners: return "Corners"
+        case .scale: return "Size"
+        case .reading: return "Reading tables"
         case .tables: return "Tables"
         case .points: return "Line-up points"
         case .details: return "Event details"
@@ -60,7 +62,8 @@ struct DiagramImportView: View {
     private func back() {
         model.selectedID = nil
         switch model.step {
-        case .tables: model.step = .room
+        case .scale: model.step = .corners
+        case .tables: model.step = .scale
         case .points: model.step = .tables
         case .details: model.step = .points
         default: break
@@ -72,7 +75,9 @@ struct DiagramImportView: View {
     private var panel: some View {
         VStack(alignment: .leading, spacing: 14) {
             switch model.step {
-            case .room: roomPanel
+            case .corners: cornersPanel
+            case .scale: scalePanel
+            case .reading: readingPanel
             case .tables: tablesPanel
             case .points: pointsPanel
             case .details: detailsPanel
@@ -84,45 +89,56 @@ struct DiagramImportView: View {
     }
 
     @ViewBuilder
-    private var roomPanel: some View {
-        if model.topLeft == nil {
-            StepTitle("Tap the room's top-left corner.")
-            StepText("Pinch to zoom in for a precise tap.")
-        } else if model.bottomRight == nil {
-            StepTitle("Now tap the bottom-right corner.")
-            Button("Redo corners", action: model.redoCorners).buttonStyle(SecondaryButtonStyle())
-        } else {
-            StepTitle("How wide is the room?")
+    private var cornersPanel: some View {
+        StepTitle(model.findingCorners ? "Finding the room's corners" : "Check the four corners.")
+        StepText("Drag each corner onto a corner of the room. For a photo of a printout, the page's corners work too. Corners snap to the walls when you let go.")
+        Button("Continue") { model.step = .scale }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(model.findingCorners || model.tightening)
+            .opacity(model.findingCorners || model.tightening ? 0.5 : 1)
+    }
+
+    @ViewBuilder
+    private var scalePanel: some View {
+        StepTitle("How big is it?")
+        Picker("Size from", selection: $model.scaleChoice) {
+            Text("Round tables").tag(DiagramImportModel.ScaleChoice.rounds)
+            Text("Room size").tag(DiagramImportModel.ScaleChoice.room)
+        }
+        .pickerStyle(.segmented)
+        if model.scaleChoice == .rounds {
             HStack {
-                TextField("Width", text: $model.widthText)
-                    .keyboardType(.decimalPad)
-                    .font(.title3.monospacedDigit())
-                    .padding(.horizontal, 12)
-                    .frame(height: 48)
-                    .background(RoundedRectangle(cornerRadius: 8).stroke(Palette.rule, lineWidth: 1.5))
-                Text("ft").foregroundStyle(Palette.secondary)
-            }
-            if let cal = model.calibration {
-                StepText("Depth works out to \(Units.describe(feet: cal.depthFt)), from the diagram's proportions.")
-            } else {
-                StepText("Use the width from the diagram or the venue's floor plan, left wall to right wall.")
-            }
-            HStack(spacing: 12) {
-                Button("Redo corners", action: model.redoCorners).buttonStyle(SecondaryButtonStyle())
-                Button(action: model.confirmRoom) {
-                    if model.waitingToConfirm {
-                        HStack(spacing: 8) {
-                            ProgressView().tint(Palette.onAccent)
-                            Text("Reading")
-                        }
-                    } else {
-                        Text("Continue")
-                    }
+                Text("Rounds on this diagram are").foregroundStyle(Palette.secondary)
+                Spacer()
+                Picker("Round size", selection: $model.roundInches) {
+                    Text("60 in").tag(60.0)
+                    Text("66 in").tag(66.0)
+                    Text("72 in").tag(72.0)
                 }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(model.calibration == nil || model.waitingToConfirm)
-                .opacity(model.calibration == nil ? 0.5 : 1)
+                .pickerStyle(.menu)
             }
+            StepText("Most banquet rounds are 60 in. If the venue's table list says otherwise, pick that.")
+        } else {
+            HStack(spacing: 12) {
+                FeetField(label: "Width", text: $model.widthText)
+                FeetField(label: "Depth", text: $model.depthText)
+            }
+            StepText("Wall to wall, matching the corners you set. This is the most accurate choice.")
+        }
+        if let error = model.readError {
+            Text(error).font(.subheadline).foregroundStyle(Palette.terracotta).fixedSize(horizontal: false, vertical: true)
+        }
+        Button("Read tables") { Task { await model.read() } }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(!model.canRead)
+            .opacity(model.canRead ? 1 : 0.5)
+    }
+
+    private var readingPanel: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+            Text("Straightening the diagram and measuring each table.")
+                .foregroundStyle(Palette.secondary)
         }
     }
 
@@ -131,10 +147,17 @@ struct DiagramImportView: View {
         if model.selected != nil {
             TableEditor(model: model)
         } else {
-            StepTitle(model.foundCount > 0
-                      ? "Found \(model.foundCount) tables. Check them against the diagram."
-                      : "No tables found. Tap each table to add it.")
-            StepText("Tap a table to fix its number, type or size. Tap an empty spot to add one.")
+            if let cal = model.calibration {
+                StepTitle("Found \(model.foundCount) tables. Room is \(Int(cal.widthFt.rounded())) × \(Int(cal.depthFt.rounded())) ft.")
+            }
+            ForEach(model.warnings, id: \.self) { w in
+                Text(w).font(.subheadline).foregroundStyle(Palette.terracotta).fixedSize(horizontal: false, vertical: true)
+            }
+            if model.guessedCount > 0 {
+                StepText("\(model.guessedCount) table \(model.guessedCount == 1 ? "number" : "numbers") couldn't be read and \(model.guessedCount == 1 ? "is" : "are") shown in gray. Tap to check \(model.guessedCount == 1 ? "it" : "them").")
+            } else {
+                StepText("Compare with the diagram. Tap a table to fix it, or an empty spot to add one.")
+            }
             Button("Continue (\(model.tableCount) tables)") {
                 model.selectedID = nil
                 model.step = .points
@@ -226,7 +249,8 @@ private struct TableEditor: View {
                         .font(.title3.weight(.semibold))
                         .padding(.horizontal, 12)
                         .frame(height: 48)
-                        .background(RoundedRectangle(cornerRadius: 8).stroke(Palette.rule, lineWidth: 1.5))
+                        .background(RoundedRectangle(cornerRadius: 8).stroke(
+                            model.guessed.contains(item.id) ? Palette.terracotta : Palette.rule, lineWidth: 1.5))
                     Menu {
                         ForEach(types, id: \.0) { t in
                             Button(t.1) { model.setType(t.0) }
@@ -241,6 +265,11 @@ private struct TableEditor: View {
                         .frame(height: 48)
                         .background(RoundedRectangle(cornerRadius: 8).stroke(Palette.rule, lineWidth: 1.5))
                     }
+                }
+                if model.guessed.contains(item.id) {
+                    Text("This number couldn't be read. Check it against the diagram.")
+                        .font(.footnote)
+                        .foregroundStyle(Palette.terracotta)
                 }
 
                 if item.type == .roundTable {
@@ -300,6 +329,26 @@ private struct SizeStepper: View {
     }
 }
 
+private struct FeetField: View {
+    var label: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label).font(.subheadline.weight(.semibold)).foregroundStyle(Palette.secondary)
+            HStack {
+                TextField("0", text: $text)
+                    .keyboardType(.decimalPad)
+                    .font(.title3.monospacedDigit())
+                Text("ft").foregroundStyle(Palette.secondary)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 48)
+            .background(RoundedRectangle(cornerRadius: 8).stroke(Palette.rule, lineWidth: 1.5))
+        }
+    }
+}
+
 private struct LabeledField: View {
     var label: String
     @Binding var text: String
@@ -340,50 +389,88 @@ private struct StepText: View {
 // MARK: Canvas
 
 /// The diagram with what's been marked drawn on top. Pinch to zoom, drag to pan, tap to mark.
+/// In the corners step, the four corners are handles; while one is dragged a magnifier shows it close up.
 private struct DiagramCanvas: View {
     @Bindable var model: DiagramImportModel
     @State private var zoom: CGFloat = 1
     @State private var zoomBase: CGFloat = 1
     @State private var pan: CGSize = .zero
     @State private var panBase: CGSize = .zero
+    @State private var dragging: Int?
+    @State private var dragStart: PlanPoint?
 
     var body: some View {
         GeometryReader { geo in
-            let iw = model.imageSize.width, ih = model.imageSize.height
+            let image = model.displayImage
+            let iw = image.size.width, ih = image.size.height
             let fit = min(geo.size.width / iw, geo.size.height / ih)
             let fitted = CGSize(width: iw * fit, height: ih * fit)
+            let origin = CGPoint(x: (geo.size.width - fitted.width) / 2, y: (geo.size.height - fitted.height) / 2)
+            let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
 
-            ZStack {
-                Image(uiImage: model.source.image)
-                    .resizable()
-                    .frame(width: fitted.width, height: fitted.height)
-                Canvas { ctx, _ in
-                    draw(&ctx, fit: fit)
-                }
-                .frame(width: fitted.width, height: fitted.height)
-                .allowsHitTesting(false)
+            // Image pixels to screen points and back, through zoom and pan.
+            let toScreen: (PlanPoint) -> CGPoint = { p in
+                let local = CGPoint(x: origin.x + p.x * fit, y: origin.y + p.y * fit)
+                return CGPoint(x: center.x + (local.x - center.x) * zoom + pan.width,
+                               y: center.y + (local.y - center.y) * zoom + pan.height)
             }
-            .scaleEffect(zoom)
-            .offset(pan)
-            .frame(width: geo.size.width, height: geo.size.height)
+            let toPixel: (CGPoint) -> PlanPoint = { s in
+                let q = CGPoint(x: (s.x - center.x - pan.width) / zoom + center.x, y: (s.y - center.y - pan.height) / zoom + center.y)
+                return PlanPoint(x: Double((q.x - origin.x) / fit), y: Double((q.y - origin.y) / fit))
+            }
+
+            ZStack(alignment: .topLeading) {
+                ZStack {
+                    Image(uiImage: image)
+                        .resizable()
+                        .frame(width: fitted.width, height: fitted.height)
+                    Canvas { ctx, _ in
+                        draw(&ctx, fit: fit)
+                    }
+                    .frame(width: fitted.width, height: fitted.height)
+                    .allowsHitTesting(false)
+                }
+                .scaleEffect(zoom)
+                .offset(pan)
+                .frame(width: geo.size.width, height: geo.size.height)
+
+                if model.step == .corners {
+                    ForEach(0..<4, id: \.self) { i in
+                        CornerHandle(active: dragging == i)
+                            .position(toScreen(model.corners[i]))
+                            .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                                .onChanged { v in
+                                    if dragging == nil { dragging = i; dragStart = model.corners[i] }
+                                    guard let start = dragStart else { return }
+                                    let d = PlanPoint(x: Double(v.translation.width / (fit * zoom)), y: Double(v.translation.height / (fit * zoom)))
+                                    model.moveCorner(i, to: start + d)
+                                }
+                                .onEnded { _ in
+                                    dragging = nil
+                                    dragStart = nil
+                                    Task { await model.tightenCorners() }
+                                })
+                    }
+                    if let i = dragging {
+                        Magnifier(image: model.source.image, at: model.corners[i])
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: toScreen(model.corners[i]).x < geo.size.width / 2 ? .trailing : .leading)
+                    }
+                }
+            }
             .contentShape(Rectangle())
             .gesture(SpatialTapGesture().onEnded { value in
-                let c = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
-                let q = CGPoint(x: (value.location.x - c.x - pan.width) / zoom + c.x,
-                                y: (value.location.y - c.y - pan.height) / zoom + c.y)
-                let origin = CGPoint(x: (geo.size.width - fitted.width) / 2, y: (geo.size.height - fitted.height) / 2)
-                let pixel = PlanPoint(x: Double((q.x - origin.x) / fit), y: Double((q.y - origin.y) / fit))
-                handleTap(pixel)
+                handleTap(toPixel(value.location))
             })
             .simultaneousGesture(MagnifyGesture()
-                .onChanged { v in zoom = min(6, max(1, zoomBase * v.magnification)) }
+                .onChanged { v in zoom = min(8, max(1, zoomBase * v.magnification)) }
                 .onEnded { _ in
                     zoomBase = zoom
                     if zoom == 1 { pan = .zero; panBase = .zero }
                 })
             .simultaneousGesture(DragGesture(minimumDistance: 12)
                 .onChanged { v in
-                    guard zoom > 1 else { return }
+                    guard zoom > 1, dragging == nil else { return }
                     pan = CGSize(width: panBase.width + v.translation.width, height: panBase.height + v.translation.height)
                 }
                 .onEnded { _ in panBase = pan })
@@ -393,11 +480,12 @@ private struct DiagramCanvas: View {
     }
 
     private func handleTap(_ pixel: PlanPoint) {
-        guard pixel.x >= 0, pixel.y >= 0, pixel.x <= Double(model.imageSize.width), pixel.y <= Double(model.imageSize.height) else { return }
+        let size = model.displayImage.size
+        guard pixel.x >= 0, pixel.y >= 0, pixel.x <= Double(size.width), pixel.y <= Double(size.height),
+              let c = model.calibration else { return }
         switch model.step {
-        case .room: model.tapRoom(at: pixel)
-        case .tables: if let c = model.calibration { model.tapTables(at: c.plan(pixel)) }
-        case .points: if let c = model.calibration { model.tapPoints(at: c.plan(pixel)) }
+        case .tables: model.tapTables(at: c.plan(pixel))
+        case .points: model.tapPoints(at: c.plan(pixel))
         default: break
         }
     }
@@ -409,22 +497,23 @@ private struct DiagramCanvas: View {
             ctx.fill(Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r)), with: .color(color))
         }
 
-        // Room corners and outline.
-        if let tl = model.topLeft {
-            if let br = model.bottomRight {
-                let a = view(tl), b = view(br)
-                ctx.stroke(Path(CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)),
-                           with: .color(Palette.Fixed.brass.swiftUI), lineWidth: line * 1.5)
-            }
-            dot(view(tl), Palette.Fixed.brass.swiftUI, 6 / zoom)
-            if let br = model.bottomRight { dot(view(br), Palette.Fixed.brass.swiftUI, 6 / zoom) }
+        switch model.step {
+        case .corners, .scale, .reading:
+            var outline = Path()
+            outline.addLines(model.corners.map(view))
+            outline.closeSubpath()
+            ctx.stroke(outline, with: .color(Palette.Fixed.brass.swiftUI), lineWidth: line * 1.5)
+            return
+        default:
+            break
         }
 
-        guard let cal = model.calibration, model.step != .room else { return }
+        guard let cal = model.calibration else { return }
         func px(_ plan: PlanPoint) -> CGPoint { view(cal.pixel(plan)) }
 
         for item in model.items {
             let selected = item.id == model.selectedID
+            let guessed = model.guessed.contains(item.id)
             let color = selected ? Palette.Fixed.terracotta.swiftUI : Palette.Fixed.sage.swiftUI
             let f = item.footprint
             var path = Path()
@@ -438,7 +527,7 @@ private struct DiagramCanvas: View {
             ctx.fill(path, with: .color(color.opacity(selected ? 0.35 : 0.22)))
             ctx.stroke(path, with: .color(color), lineWidth: line * (selected ? 1.5 : 1))
 
-            let tag = Text(item.shortLabel)
+            let tag = Text(guessed ? "\(item.shortLabel)?" : item.shortLabel)
                 .font(.system(size: 11 / zoom, weight: .bold).monospacedDigit())
                 .foregroundColor(.white)
             let resolved = ctx.resolve(tag)
@@ -446,7 +535,8 @@ private struct DiagramCanvas: View {
             let c = px(f.center)
             let plate = CGRect(x: c.x - size.width / 2 - 4 / zoom, y: c.y - size.height / 2 - 2 / zoom,
                                width: size.width + 8 / zoom, height: size.height + 4 / zoom)
-            ctx.fill(Path(roundedRect: plate, cornerRadius: 3 / zoom), with: .color(color))
+            let plateColor = selected ? Palette.Fixed.terracotta.swiftUI : (guessed ? Palette.Fixed.slate.swiftUI : Palette.Fixed.sage.swiftUI)
+            ctx.fill(Path(roundedRect: plate, cornerRadius: 3 / zoom), with: .color(plateColor))
             ctx.draw(resolved, at: c)
         }
 
@@ -455,6 +545,66 @@ private struct DiagramCanvas: View {
             let c = px(point)
             dot(c, Palette.Fixed.brass.swiftUI, 11 / zoom)
             ctx.draw(Text(letter).font(.system(size: 12 / zoom, weight: .bold)).foregroundColor(.white), at: c)
+        }
+    }
+}
+
+/// A corner handle: a ring with a dot at the exact point, big enough to grab.
+private struct CornerHandle: View {
+    var active: Bool
+
+    var body: some View {
+        ZStack {
+            Circle().fill(Color.white.opacity(0.001)).frame(width: 48, height: 48)
+            Circle().stroke(Palette.Fixed.brass.swiftUI, lineWidth: 3).frame(width: active ? 30 : 24, height: active ? 30 : 24)
+            Circle().fill(Palette.Fixed.brass.swiftUI).frame(width: 5, height: 5)
+        }
+        .accessibilityLabel("Corner")
+    }
+}
+
+/// Close-up of the image around a point, with crosshairs, so a corner can be placed exactly.
+private struct Magnifier: View {
+    var image: UIImage
+    var at: PlanPoint
+    let size: CGFloat = 132
+    let power: CGFloat = 4
+
+    var body: some View {
+        ZStack {
+            if let crop = closeUp() {
+                Image(uiImage: crop)
+                    .resizable()
+                    .interpolation(.none)
+                    .frame(width: size, height: size)
+            }
+            Path { p in
+                p.move(to: CGPoint(x: size / 2, y: 0)); p.addLine(to: CGPoint(x: size / 2, y: size))
+                p.move(to: CGPoint(x: 0, y: size / 2)); p.addLine(to: CGPoint(x: size, y: size / 2))
+            }
+            .stroke(Palette.Fixed.terracotta.swiftUI, lineWidth: 1)
+        }
+        .frame(width: size, height: size)
+        .background(Palette.Fixed.linen.swiftUI)
+        .clipShape(Circle())
+        .overlay(Circle().stroke(Palette.Fixed.ink.swiftUI, lineWidth: 2))
+        .allowsHitTesting(false)
+    }
+
+    /// Just the pixels around the point, padded with white past the image's edge.
+    private func closeUp() -> UIImage? {
+        guard let cg = image.cgImage else { return nil }
+        let side = Int(size / power)
+        let rect = CGRect(x: Int(at.x) - side / 2, y: Int(at.y) - side / 2, width: side, height: side)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: format).image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: side, height: side))
+            if let piece = cg.cropping(to: rect.intersection(CGRect(x: 0, y: 0, width: cg.width, height: cg.height))) {
+                let drawAt = CGRect(x: max(0, -rect.minX), y: max(0, -rect.minY), width: CGFloat(piece.width), height: CGFloat(piece.height))
+                UIImage(cgImage: piece).draw(in: drawAt)
+            }
         }
     }
 }
