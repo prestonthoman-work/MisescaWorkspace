@@ -60,6 +60,22 @@ final class LayoutLoaderTests: XCTestCase {
         }
     }
 
+    func testOvalTableLoads() throws {
+        let json = """
+        {"event":{"name":"X","room":"R"},"room":{"width_ft":30,"depth_ft":20},
+         "reference_points":{"A":{"x":5,"y":5,"label":"a"},"B":{"x":25,"y":5,"label":"b"}},
+         "items":[{"id":"T1","type":"oval_table","x":10,"y":10,"length_ft":8,"width_ft":4,"rotation":30}]}
+        """
+        let layout = try LayoutLoader.load(Data(json.utf8))
+        let oval = try XCTUnwrap(layout.items.first)
+        XCTAssertEqual(oval.type, .ovalTable)
+        XCTAssertTrue(oval.type.isTable)
+        XCTAssertEqual(oval.size.length, 8)
+        XCTAssertEqual(oval.size.width, 4)
+        XCTAssertEqual(layout.counts.ovalTables, 1)
+        XCTAssertEqual(DiagramLayoutBuilder.defaultSeats(.ovalTable, length: 8, width: 4), 9)
+    }
+
     func testNotJSON() {
         XCTAssertThrowsError(try LayoutLoader.load(Data("hello".utf8))) { e in
             XCTAssertEqual((e as? LayoutError)?.message, "This isn't a Misesca layout file. Layout files end in .json, like the samples.")

@@ -23,7 +23,7 @@ enum GhostFactory {
 
     static func height(for type: ItemType) -> Float {
         switch type {
-        case .roundTable, .banquetTable: return tableHeight
+        case .roundTable, .banquetTable, .ovalTable: return tableHeight
         case .stage: return stageHeight
         case .bar: return barHeight
         case .danceFloor: return floorPanelHeight
@@ -45,6 +45,8 @@ enum GhostFactory {
         let mesh: MeshResource
         if item.type == .roundTable {
             mesh = cylinder(radius: length / 2, height: h)
+        } else if item.type == .ovalTable {
+            mesh = cylinder(radius: length / 2, height: h, depthScale: width / length)
         } else {
             mesh = .generateBox(size: [length, h, width])
         }
@@ -136,7 +138,8 @@ enum GhostFactory {
     }
 
     /// A closed cylinder centered on the origin. RealityKit's own cylinder needs iOS 18.
-    static func cylinder(radius: Float, height: Float, segments: Int = 48) -> MeshResource {
+    /// `depthScale` below 1 squashes it along z into an oval table.
+    static func cylinder(radius: Float, height: Float, depthScale: Float = 1, segments: Int = 48) -> MeshResource {
         var positions: [SIMD3<Float>] = []
         var normals: [SIMD3<Float>] = []
         var indices: [UInt32] = []
@@ -147,15 +150,16 @@ enum GhostFactory {
             for i in 0...segments {
                 let a = Float(i) / Float(segments) * 2 * .pi
                 let x = cos(a), z = sin(a)
-                positions.append([x * radius, y, z * radius])
+                positions.append([x * radius, y, z * radius * depthScale])
                 normals.append(normal(x, z))
             }
             return start
         }
 
-        // Side wall.
-        let bottom = ring(y: -half) { x, z in [x, 0, z] }
-        let top = ring(y: half) { x, z in [x, 0, z] }
+        // Side wall. On an oval the wall faces out along (x, z / depthScale).
+        func side(_ x: Float, _ z: Float) -> SIMD3<Float> { simd_normalize(SIMD3<Float>(x, 0, z / depthScale)) }
+        let bottom = ring(y: -half, normal: side)
+        let top = ring(y: half, normal: side)
         for i in 0..<UInt32(segments) {
             indices += [bottom + i, top + i, bottom + i + 1, bottom + i + 1, top + i, top + i + 1]
         }

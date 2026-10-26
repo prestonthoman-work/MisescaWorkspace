@@ -28,13 +28,51 @@ public enum RegionTracer {
             }
             if !ok { return nil }
         }
+
+        init(width: Int, height: Int, pixels: [UInt8]) {
+            self.width = width
+            self.height = height
+            self.pixels = pixels
+        }
+
+        /// The same image at another scale: box-averaged when shrinking, bilinear when enlarging.
+        func resized(by f: Double) -> Gray? {
+            let nw = Int(Double(width) * f), nh = Int(Double(height) * f)
+            guard nw >= 16, nh >= 16 else { return nil }
+            var out = [UInt8](repeating: 255, count: nw * nh)
+            if f < 1 {
+                let k = Int((1 / f).rounded())
+                for y in 0..<nh {
+                    for x in 0..<nw {
+                        var sum = 0
+                        for dy in 0..<k { for dx in 0..<k { sum += Int(pixels[(y * k + dy) * width + x * k + dx]) } }
+                        out[y * nw + x] = UInt8(sum / (k * k))
+                    }
+                }
+            } else {
+                for y in 0..<nh {
+                    let sy = min(max((Double(y) + 0.5) / f - 0.5, 0), Double(height - 1))
+                    let y0 = min(Int(sy), height - 2), fy = sy - Double(y0)
+                    for x in 0..<nw {
+                        let sx = min(max((Double(x) + 0.5) / f - 0.5, 0), Double(width - 1))
+                        let x0 = min(Int(sx), width - 2), fx = sx - Double(x0)
+                        let a = Double(pixels[y0 * width + x0]), b = Double(pixels[y0 * width + x0 + 1])
+                        let c = Double(pixels[(y0 + 1) * width + x0]), d = Double(pixels[(y0 + 1) * width + x0 + 1])
+                        out[y * nw + x] = UInt8(((a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy).rounded())
+                    }
+                }
+            }
+            return Gray(width: nw, height: nh, pixels: out)
+        }
     }
 
     /// Ink is any pixel clearly darker than its neighborhood, so faint gray lines on a gray
     /// floor count as well as black lines on white. Thin gaps are closed by growing ink one pixel.
     static let growPixels = 2
 
-    static func inkMask(_ g: Gray) -> [Bool] {
+    /// `findLines` also finds faint lines in a grainy photo by their shape. It's for table
+    /// outlines; walls are found from ink alone, which the extra lines would confuse.
+    static func inkMask(_ g: Gray, findLines: Bool = false) -> [Bool] {
         let w = g.width, h = g.height
         // Photos carry sensor noise that would read as specks of ink and break up table insides.
         // Smooth over 3x3 first, and set the bar relative to the noise that's left.
@@ -122,6 +160,15 @@ public enum RegionTracer {
                 }
             }
         }
+        // In a noisy photo a faint line can be barely darker than the floor's grain, so darkness
+        // alone leaves gaps in it and speckles the floor. Its shape gives it away: across a line,
+        // brightness dips sharply in one direction only, where grain dips in round specks.
+        if findLines && sigma >= ridgeNoise {
+            for i in ridgePixels(g) where !ink[i] {
+                ink[i] = true
+                stack.append(i)
+            }
+        }
         while let i = stack.popLast() {
             let x = i % w, y = i / w
             for dy in -1...1 {
@@ -153,6 +200,91 @@ public enum RegionTracer {
         return grown
     }
 
+    /// Noise level, in gray steps between neighbors, above which an image is treated as a photo
+    /// and lines are also found by their shape. Clean exports measure close to zero.
+    static let ridgeNoise = 1.5
+    /// Smoothing for finding lines by shape, in pixels: about half a photographed line's width.
+    static let ridgeSmoothing: Float = 2.5
+    /// How far above the image's typical curvature a line must stand out.
+    static let ridgeStrength: Float = 3
+
+    /// Pixels on thin dark lines: where brightness, smoothed, curves up sharply across one
+    /// direction and little along the other. Indices into the image, row by row.
+    static func ridgePixels(_ g: Gray) -> [Int] {
+        let w = g.width, h = g.height
+        guard w > 8, h > 8 else { return [] }
+        let smooth = gaussian(g, sd: ridgeSmoothing)
+        // Curvature: the larger eigenvalue of the second derivatives is the dip across a line.
+        var strongest = [Float](repeating: 0, count: w * h)
+        var lineLike = [Bool](repeating: false, count: w * h)
+        var sample: [Float] = []
+        sample.reserveCapacity(w * h / 16)
+        for y in 1..<(h - 1) {
+            for x in 1..<(w - 1) {
+                let i = y * w + x
+                let dxx = smooth[i + 1] + smooth[i - 1] - 2 * smooth[i]
+                let dyy = smooth[i + w] + smooth[i - w] - 2 * smooth[i]
+                let dxy = (smooth[i + w + 1] - smooth[i + w - 1] - smooth[i - w + 1] + smooth[i - w - 1]) / 4
+                let half = (dxx - dyy) / 2
+                let root = (half * half + dxy * dxy).squareRoot()
+                let big = (dxx + dyy) / 2 + root, small = (dxx + dyy) / 2 - root
+                strongest[i] = big
+                // A round speck curves the same both ways; a line hardly at all along itself.
+                lineLike[i] = big > 0 && small < big * 0.4
+                if x % 4 == 0 && y % 4 == 0 { sample.append(abs(big)) }
+            }
+        }
+        sample.sort()
+        guard let typical = sample.isEmpty ? nil : sample[sample.count / 2], typical > 0 else { return [] }
+        let bar = typical * ridgeStrength
+        var out: [Int] = []
+        for i in 0..<(w * h) where lineLike[i] && strongest[i] > bar { out.append(i) }
+        return out
+    }
+
+    /// The image blurred by a Gaussian of `sd` pixels, separably.
+    static func gaussian(_ g: Gray, sd: Float) -> [Float] {
+        let w = g.width, h = g.height
+        let radius = Int((sd * 3).rounded(.up))
+        var kernel = (-radius...radius).map { exp(-Float($0 * $0) / (2 * sd * sd)) }
+        let total = kernel.reduce(0, +)
+        kernel = kernel.map { $0 / total }
+        var across = [Float](repeating: 0, count: w * h)
+        for y in 0..<h {
+            for x in 0..<w {
+                var v: Float = 0
+                for k in -radius...radius {
+                    let xx = min(max(x + k, 0), w - 1)
+                    v += kernel[k + radius] * Float(g.pixels[y * w + xx])
+                }
+                across[y * w + x] = v
+            }
+        }
+        var out = [Float](repeating: 0, count: w * h)
+        for y in 0..<h {
+            for x in 0..<w {
+                var v: Float = 0
+                for k in -radius...radius {
+                    let yy = min(max(y + k, 0), h - 1)
+                    v += kernel[k + radius] * across[yy * w + x]
+                }
+                out[y * w + x] = v
+            }
+        }
+        return out
+    }
+
+    /// Typical difference between neighboring pixels: about zero for a clean export, several
+    /// gray steps for a phone photo.
+    static func grain(_ g: Gray) -> Int {
+        var diffs: [Int] = []
+        for y in stride(from: 1, to: g.height, by: 4) {
+            for x in stride(from: 1, to: g.width, by: 4) { diffs.append(abs(Int(g.pixels[y * g.width + x]) - Int(g.pixels[y * g.width + x - 1]))) }
+        }
+        diffs.sort()
+        return diffs.isEmpty ? 0 : diffs[diffs.count / 2]
+    }
+
     /// Per-region running totals, collected from horizontal runs of pixels.
     struct RegionStats {
         var pixels = 0
@@ -160,10 +292,14 @@ public enum RegionTracer {
         var touchesEdge = false
         /// Leftmost and rightmost pixel of each row, for the filled (hole-free) shape.
         var rows: [Int: (Int, Int)] = [:]
+        /// Widest hole crossed by any row. Letters written on a table leave narrow holes;
+        /// the middle of a ring or frame leaves one wide one.
+        var widestGap = 0
     }
 
     /// Connected regions of `target` pixels (4-connected), labelled with union-find over runs.
-    static func regions(of mask: [Bool], target: Bool, width w: Int, height h: Int, minPixels: Int, maxPixels: Int) -> [RegionStats] {
+    static func regions(of mask: [Bool], target: Bool, width w: Int, height h: Int, minPixels: Int, maxPixels: Int,
+                        keepEdge: Bool = false) -> [RegionStats] {
         var parent: [Int] = []
         func find(_ a: Int) -> Int {
             var a = a
@@ -213,17 +349,19 @@ public enum RegionTracer {
             s.minY = min(s.minY, r.y); s.maxY = max(s.maxY, r.y)
             if r.x0 == 0 || r.x1 == w - 1 || r.y == 0 || r.y == h - 1 { s.touchesEdge = true }
             if let existing = s.rows[r.y] {
+                // Runs arrive left to right, so the gap is from the row's right end so far.
+                s.widestGap = max(s.widestGap, r.x0 - existing.1 - 1)
                 s.rows[r.y] = (min(existing.0, r.x0), max(existing.1, r.x1))
             } else {
                 s.rows[r.y] = (r.x0, r.x1)
             }
             stats[root] = s
         }
-        return stats.values.filter { !$0.touchesEdge && $0.pixels >= minPixels && $0.pixels <= maxPixels }
+        return stats.values.filter { (keepEdge || !$0.touchesEdge) && $0.pixels >= minPixels && $0.pixels <= maxPixels }
     }
 
     /// Shape of a region from its filled row spans: centroid, principal axes, and fit tests.
-    static func shape(of s: RegionStats, inflate: Double) -> DiagramShape? {
+    static func shape(of s: RegionStats, inflate: Double, ink: Bool = false) -> DiagramShape? {
         var area = 0.0, sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0
         for (y, span) in s.rows {
             // Treat each row as a strip of pixel centers from span.0 to span.1.
@@ -239,8 +377,13 @@ public enum RegionTracer {
         }
         guard area > 0 else { return nil }
         // Holes (like a table number) don't change the filled shape, but a region that is
-        // mostly holes is a ring or a frame, not a table.
-        guard Double(s.pixels) / area > 0.55 else { return nil }
+        // mostly holes is a ring or a frame, not a table. "Table 12" written across a small
+        // table can hide nearly half of it, so many narrow holes are still a table.
+        let solidity = Double(s.pixels) / area
+        let narrowHoles = Double(s.widestGap) < Double(s.maxX - s.minX + 1) * 0.35
+        guard solidity > 0.55 || (solidity > 0.3 && narrowHoles) else { return nil }
+        // Solid ink with a wide hole is a ring, such as a table and its chairs run together.
+        if ink && !narrowHoles && solidity < 0.8 { return nil }
 
         let cx = sx / area, cy = sy / area
         let vxx = sxx / area - cx * cx, vyy = syy / area - cy * cy, vxy = sxy / area - cx * cy
@@ -249,7 +392,15 @@ public enum RegionTracer {
         let l1 = tr / 2 + disc, l2 = max(tr / 2 - disc, 1e-9)
         let center = PlanPoint(x: cx, y: cy)
 
-        let angle = 0.5 * atan2(2 * vxy, vxx - vyy)
+        var angle = 0.5 * atan2(2 * vxy, vxx - vyy)
+        // A square spreads the same way in every direction, so its moments say nothing about
+        // its turn. Take the turn of the smallest box around its outline instead.
+        if l1 / l2 < 1.15 {
+            let outline = s.rows.flatMap { y, span in [PlanPoint(x: Double(span.0), y: Double(y)), PlanPoint(x: Double(span.1), y: Double(y))] }
+            if let box = ShapeClassifier.minimumAreaRectangle(ShapeClassifier.convexHull(outline)) {
+                angle = box.rotationDegrees * .pi / 180
+            }
+        }
         let cosA = cos(angle), sinA = sin(angle)
 
         // Ellipse (circle) model: semi-axes 2*sqrt(lambda). Rectangle model: sides sqrt(12*lambda).
@@ -262,12 +413,14 @@ public enum RegionTracer {
         let rectError = abs(area / (length * width) - 1)
 
         var maxEllipseRadius = 0.0, maxBoxReach = 0.0
+        var u0 = Double.infinity, u1 = -Double.infinity, v0 = Double.infinity, v1 = -Double.infinity
         for (y, span) in s.rows {
             for x in [Double(span.0), Double(span.1)] {
                 let dx = x - cx, dy = Double(y) - cy
                 let u = dx * cosA + dy * sinA, v = -dx * sinA + dy * cosA
                 maxEllipseRadius = max(maxEllipseRadius, (u * u) / (a * a) + (v * v) / (b * b))
                 maxBoxReach = max(maxBoxReach, max(abs(u) / (length / 2), abs(v) / (width / 2)))
+                u0 = min(u0, u); u1 = max(u1, u); v0 = min(v0, v); v1 = max(v1, v)
             }
         }
 
@@ -282,10 +435,25 @@ public enum RegionTracer {
                                 rotationDegrees: normalizedAngle(angle * 180 / .pi))
         }
         if rectOK {
+            // A square looks the same a quarter turn round, so only its turn within 90 degrees counts.
+            var turn = normalizedAngle(angle * 180 / .pi)
+            if length / width < 1.04 {
+                turn = turn.truncatingRemainder(dividingBy: 90)
+                if turn > 89.5 || turn < 0.5 { turn = 0 }
+            }
             return DiagramShape(kind: .rectangle, center: center, length: length + inflate, width: width + inflate,
-                                rotationDegrees: length / width < 1.04 ? 0 : normalizedAngle(angle * 180 / .pi))
+                                rotationDegrees: turn)
         }
-        return nil
+        // Neither: keep its turned bounding box, for a named bar or table of an unusual shape.
+        // Mostly-hollow regions are line work, not objects.
+        guard solidity > 0.55 else { return nil }
+        let mid = PlanPoint(x: (u0 + u1) / 2, y: (v0 + v1) / 2)
+        let boxCenter = center + PlanPoint(x: mid.x * cosA - mid.y * sinA, y: mid.x * sinA + mid.y * cosA)
+        // Row ends are pixel centers; the region reaches half a pixel further.
+        var l = u1 - u0 + 1 + inflate, wd = v1 - v0 + 1 + inflate, turn = angle * 180 / .pi
+        if wd > l { swap(&l, &wd); turn += 90 }
+        guard l > 0, wd > 0 else { return nil }
+        return DiagramShape(kind: .other, center: boxCenter, length: l, width: wd, rotationDegrees: normalizedAngle(turn))
     }
 
     static func normalizedAngle(_ deg: Double) -> Double {
@@ -298,26 +466,172 @@ public enum RegionTracer {
     /// All table-like shapes: insides of outlines, and solid filled shapes, with edges refined
     /// to a fraction of a pixel. When tables set the scale, a one-pixel bias on a 70-pixel table
     /// is over a foot of error across a ballroom.
+    ///
+    /// The image is searched at more than one scale. Full size finds most things. Half size
+    /// joins up outlines that are broken, blurred or patterned in a photo, and big objects.
+    /// A small image is also searched at double size, so a small table's inside isn't closed
+    /// up by the ink growing over it. Every shape is measured on the full-size image.
     public static func shapes(in image: CGImage) -> [DiagramShape] {
+        Scan(image).map { shapes(in: $0) } ?? []
+    }
+
+    /// One image made ready for finding shapes, so the work is shared between passes.
+    public struct Scan {
+        let gray: Gray
+        /// Ink at full size, with faint lines found by their shape.
+        let ink: [Bool]
+        /// What edges are measured on: the image itself, or for a grainy photo a lightly smoothed
+        /// copy, so grain doesn't pull edges about.
+        let edges: Gray
+
+        public init?(_ image: CGImage) {
+            guard let g = Gray(image) else { return nil }
+            gray = g
+            ink = inkMask(g, findLines: true)
+            edges = grain(g) >= 3
+                ? Gray(width: g.width, height: g.height, pixels: gaussian(g, sd: 1).map { UInt8(min(255, max(0, $0.rounded()))) })
+                : g
+        }
+    }
+
+    static func shapes(in scan: Scan) -> [DiagramShape] {
+        let g = scan.gray
+        var found = roughShapes(g, ink: scan.ink)
+        // Other scales only fill in places where nothing was found at full size. Coarser, a
+        // table and its chairs run together into one bigger blob over the table.
+        let fullSize = found.map(\.0)
+        func add(_ more: [(DiagramShape, Edge)]) {
+            for (s, e) in more where !fullSize.contains(where: { overlaps($0, s) })
+                && !found.contains(where: { sameObject($0.0, s) }) {
+                found.append((s, e))
+            }
+        }
+        if min(g.width, g.height) >= 400, let half = g.resized(by: 0.5) {
+            add(roughShapes(half).map { (scaled($0.0, by: 2), $0.1) })
+        }
+        if max(g.width, g.height) <= 1300, let double = g.resized(by: 2) {
+            add(roughShapes(double).map { (scaled($0.0, by: 0.5), $0.1) })
+        }
+        return found.compactMap { refine($0.0, gray: scan.edges, edge: $0.1) }.map(toImageCoordinates)
+    }
+
+    /// A quicker look, at full size from ink alone: enough to find the round tables that set a
+    /// photo's proportions while it's being straightened.
+    public static func quickShapes(in image: CGImage) -> [DiagramShape] {
         guard let g = Gray(image) else { return [] }
+        return roughShapes(g, ink: inkMask(g)).compactMap { refine($0.0, gray: g, edge: $0.1) }.map(toImageCoordinates)
+    }
+
+    /// Pixel indices have their centers at whole numbers; image coordinates put them half a pixel in.
+    static func toImageCoordinates(_ s: DiagramShape) -> DiagramShape {
+        var s = s
+        s.center = s.center + PlanPoint(x: 0.5, y: 0.5)
+        return s
+    }
+
+    /// Shapes hidden by their own labels. "Table 12" written across a small table cuts its
+    /// inside in two; with the recognized text cleared away the whole inside shows. Each label
+    /// is cleared on its own, in a window that grows until the region under it is closed, so a
+    /// misread row of chairs beside a table can't open up that table's outline. Text over an
+    /// outline opens it up instead, and then nothing is found there.
+    public static func shapes(in image: CGImage, under texts: [DiagramText]) -> [DiagramShape] {
+        Scan(image).map { shapes(in: $0, under: texts) } ?? []
+    }
+
+    static func shapes(in scan: Scan, under texts: [DiagramText]) -> [DiagramShape] {
+        let boxes = texts.filter { $0.width > 0 && $0.height > 0 }
+        guard !boxes.isEmpty else { return [] }
+        let g = scan.gray, ink = scan.ink
         let w = g.width, h = g.height
-        let ink = inkMask(g)
+        let minPixels = max(60, w * h / 40000), maxPixels = w * h / 6
+        // Ink grew past the letters; clear that too. A table's outline running through the text
+        // box stays: it crosses the box from side to side and carries on past it. Letters never
+        // fill the padded box top to bottom, but grown letters do run together side to side, so a
+        // line along the text must carry on well past the box to count.
+        let pad = Double(growPixels + 1)
+        let reach = 3 * (growPixels + 2)
+        var out: [DiagramShape] = []
+        for t in boxes {
+            let x0 = max(reach, Int(t.center.x - t.width / 2 - pad)), x1 = min(w - 1 - reach, Int(t.center.x + t.width / 2 + pad))
+            let y0 = max(1, Int(t.center.y - t.height / 2 - pad)), y1 = min(h - 2, Int(t.center.y + t.height / 2 + pad))
+            guard x0 < x1, y0 < y1 else { continue }
+            let lineColumns = Set((x0...x1).filter { x in (y0 - 1...y1 + 1).allSatisfy { ink[$0 * w + x] } })
+            let lineRows = Set((y0...y1).filter { y in (x0 - reach...x1 + reach).allSatisfy { ink[y * w + $0] } })
+            let cx = Int(t.center.x), cy = Int(t.center.y)
+            var half = Int(max(t.width, t.height))
+            while true {
+                let wx0 = max(0, cx - half), wx1 = min(w, cx + half), wy0 = max(0, cy - half), wy1 = min(h, cy + half)
+                let ww = wx1 - wx0, wh = wy1 - wy0
+                var local = [Bool](repeating: false, count: ww * wh)
+                for y in 0..<wh { for x in 0..<ww { local[y * ww + x] = ink[(y + wy0) * w + x + wx0] } }
+                for y in y0...y1 where !lineRows.contains(y) && y >= wy0 && y < wy1 {
+                    for x in x0...x1 where !lineColumns.contains(x) && x >= wx0 && x < wx1 { local[(y - wy0) * ww + x - wx0] = false }
+                }
+                // A region touching the window's edge may only be cut off by it; look wider. Once
+                // the window is the whole image, touching the edge means it's the open floor.
+                let all = regions(of: local, target: false, width: ww, height: wh, minPixels: 0, maxPixels: .max, keepEdge: true)
+                // The region under the label; the floor around a table spans the label's row too, so the smallest.
+                guard let r = all.filter({ r in r.rows[cy - wy0].map { $0.0 <= cx - wx0 && $0.1 >= cx - wx0 } ?? false })
+                        .min(by: { $0.pixels < $1.pixels }),
+                      r.pixels <= maxPixels else { break }
+                if r.touchesEdge {
+                    if wx0 == 0 && wy0 == 0 && wx1 == w && wy1 == h { break }
+                    half *= 2
+                    continue
+                }
+                if r.pixels >= minPixels, var shape = shape(of: r, inflate: Double(2 * growPixels + 2)) {
+                    shape.center = shape.center + PlanPoint(x: Double(wx0), y: Double(wy0))
+                    let box = Footprint(center: shape.center, length: shape.length, width: shape.width, rotationDegrees: shape.rotationDegrees)
+                    if box.contains(t.center), let refined = refine(shape, gray: scan.edges, edge: .line) {
+                        out.append(toImageCoordinates(refined))
+                    }
+                }
+                break
+            }
+        }
+        return out
+    }
+
+    /// Shapes at one scale, before their edges are measured, in that scale's pixel indices.
+    static func roughShapes(_ g: Gray, ink given: [Bool]? = nil) -> [(DiagramShape, Edge)] {
+        let w = g.width, h = g.height
+        let ink = given ?? inkMask(g, findLines: true)
         let minPixels = max(60, w * h / 40000)
         let maxPixels = w * h / 6
         // Rough sizes first: an inside region stops short of its line's middle by the grown
         // pixels plus half a line; a solid region grew by the same pixels all round.
         let insides = regions(of: ink, target: false, width: w, height: h, minPixels: minPixels, maxPixels: maxPixels)
             .compactMap { shape(of: $0, inflate: Double(2 * growPixels + 2)) }
-            .compactMap { refine($0, gray: g, edge: .line) }
+            .map { ($0, Edge.line) }
         let solids = regions(of: ink, target: true, width: w, height: h, minPixels: minPixels, maxPixels: maxPixels)
-            .compactMap { shape(of: $0, inflate: -Double(2 * growPixels)) }
-            .compactMap { refine($0, gray: g, edge: .step) }
-        // Pixel indices have their centers at whole numbers; image coordinates put them half a pixel in.
-        return (insides + solids).map { s in
-            var s = s
-            s.center = s.center + PlanPoint(x: 0.5, y: 0.5)
-            return s
+            .compactMap { shape(of: $0, inflate: -Double(2 * growPixels), ink: true) }
+            .map { ($0, Edge.step) }
+        return insides + solids
+    }
+
+    /// From another scale's pixel indices into full-size ones. Pixel i at scale k covers
+    /// full-size pixels from i/k to (i+1)/k, so its center is at (i + 0.5)/k - 0.5.
+    static func scaled(_ s: DiagramShape, by f: Double) -> DiagramShape {
+        var s = s
+        s.center = PlanPoint(x: (s.center.x + 0.5) * f - 0.5, y: (s.center.y + 0.5) * f - 0.5)
+        s.length *= f
+        s.width *= f
+        return s
+    }
+
+    /// Either shape's center lies inside the other.
+    static func overlaps(_ a: DiagramShape, _ b: DiagramShape) -> Bool {
+        func box(_ s: DiagramShape) -> Footprint {
+            Footprint(center: s.center, length: s.length, width: s.width, rotationDegrees: s.rotationDegrees)
         }
+        return box(a).contains(b.center) || box(b).contains(a.center)
+    }
+
+    /// The same object seen twice: centers close together and sizes alike.
+    static func sameObject(_ a: DiagramShape, _ b: DiagramShape) -> Bool {
+        let size = min(a.width, b.width)
+        let ratio = (a.length * a.width) / max(b.length * b.width, 1e-9)
+        return a.center.distance(to: b.center) < max(2, size * 0.3) && ratio > 0.6 && ratio < 1 / 0.6
     }
 
     enum Edge { case line, step }
@@ -451,6 +765,9 @@ public enum RegionTracer {
     static func refine(_ shape: DiagramShape, gray g: Gray, edge: Edge) -> DiagramShape? {
         let c = shape.center
         switch shape.kind {
+        case .other:
+            // No single edge to follow; the region's box is as close as it gets.
+            return shape
         case .circle, .ellipse:
             let a = shape.length / 2, b = shape.width / 2
             let rot = shape.rotationDegrees * .pi / 180

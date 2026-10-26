@@ -83,7 +83,9 @@ public enum DiagramPipeline {
             width = Double(size.width)
             guard let img = rectify(source, corners: q, width: size.width, height: size.height) else { throw DiagramError.unreadable }
             image = img
-            reading = try DiagramReader.read(img)
+            // A quick look while straightening; the full search and text are done once, on the final image.
+            reading = DiagramReading(imageWidth: Double(img.width), imageHeight: Double(img.height),
+                                     shapes: RegionTracer.quickShapes(in: img), texts: [])
             pass += 1
             // A photo's true proportions aren't in the photo. Round tables are round, so if they
             // came out oval, stretch the height until they don't, then read again.
@@ -92,6 +94,13 @@ public enum DiagramPipeline {
                   abs(stretch - 1) > 0.003 else { break }
             aspect *= stretch
         } while true
+
+        guard let scan = RegionTracer.Scan(image) else { throw DiagramError.unreadable }
+        reading.shapes = RegionTracer.shapes(in: scan)
+        reading.texts = try DiagramReader.readText(image)
+        // Tables cut up by their own labels. Only real labels: chairs read as "UU" sit on a table's edge.
+        let underText = RegionTracer.shapes(in: scan, under: reading.texts.filter { DiagramLayoutBuilder.isLabelOrName($0.text) })
+        reading.shapes += underText.filter { s in !reading.shapes.contains { RegionTracer.sameObject($0, s) } }
 
         let feetPerPixel: Double
         switch setup.scale {
@@ -105,14 +114,15 @@ public enum DiagramPipeline {
                                              bottomRight: PlanPoint(x: Double(image.width), y: Double(image.height)),
                                              feetPerPixel: feetPerPixel)
 
-        // Read numbers only on what turned out to be tables.
-        let first = DiagramLayoutBuilder.items(from: reading, calibration: calibration)
+        // Read numbers only on what may turn out to be tables, including small ones that
+        // only count as tables if they carry a number or name.
+        let first = DiagramLayoutBuilder.items(from: reading, calibration: calibration, includeUnlabeledSmall: true)
         let tableShapes = first.filter(\.type.isTable).map { item -> DiagramShape in
             let s = item.size
             return DiagramShape(kind: item.type == .roundTable ? .circle : .rectangle, center: calibration.pixel(item.center),
                                 length: s.length / feetPerPixel, width: s.width / feetPerPixel, rotationDegrees: item.rotationDegrees)
         }
-        reading.texts += DiagramReader.readLabels(at: tableShapes, in: image)
+        reading.texts += DiagramReader.readLabels(at: tableShapes, in: image, page: reading.texts)
         let (items, guessed) = DiagramLayoutBuilder.itemsAndGuesses(from: reading, calibration: calibration)
 
         var warnings: [String] = []
@@ -122,6 +132,11 @@ public enum DiagramPipeline {
         }
         if case .roundDiameter = setup.scale, let spread = DiagramScale.typicalRound(in: reading.shapes)?.spread, spread > spreadLimit {
             warnings.append("This image is hard to measure precisely, so tables may be up to a foot off. For the best result, use a sharper image or enter the room's width and depth.")
+        }
+        let missing = DiagramLayoutBuilder.namedWithoutOutline(reading.texts, items: items, calibration: calibration)
+        if !missing.isEmpty {
+            let list = missing.prefix(6).map { "\u{201C}\($0)\u{201D}" }.joined(separator: ", ")
+            warnings.append("The diagram names \(list), but no outline was found for \(missing.count == 1 ? "it" : "them"). Add \(missing.count == 1 ? "it" : "them") at review if missing.")
         }
         return DiagramResult(image: image, calibration: calibration, items: items, corners: q, warnings: warnings, guessedLabels: guessed)
     }

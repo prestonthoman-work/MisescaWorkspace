@@ -3,7 +3,10 @@ import CoreGraphics
 
 /// A table-like shape found in a diagram image. Units are image pixels, y down.
 public struct DiagramShape: Hashable, Sendable {
-    public enum Kind: String, Sendable { case circle, ellipse, rectangle }
+    /// `other` is a closed shape that is neither round nor rectangular, such as an L-shaped bar
+    /// or a half-moon table, measured by its turned bounding box. It only becomes an item when
+    /// the diagram names it.
+    public enum Kind: String, Sendable { case circle, ellipse, rectangle, other }
     public var kind: Kind
     public var center: PlanPoint
     /// Diameter for circles, long axis for ellipses, long side for rectangles.
@@ -24,10 +27,15 @@ public struct DiagramShape: Hashable, Sendable {
 public struct DiagramText: Hashable, Sendable {
     public var text: String
     public var center: PlanPoint
+    /// Size of the line of text, level, or zero when unknown.
+    public var width: Double
+    public var height: Double
 
-    public init(text: String, center: PlanPoint) {
+    public init(text: String, center: PlanPoint, width: Double = 0, height: Double = 0) {
         self.text = text
         self.center = center
+        self.width = width
+        self.height = height
     }
 }
 
@@ -208,71 +216,207 @@ public enum ShapeClassifier {
     }
 }
 
-/// Turns what was found in a diagram into layout items, using real-world sizes to tell
-/// tables from text, the room outline and everything else.
+/// Turns what was found in a diagram into layout items.
+///
+/// Evidence comes first: a shape the diagram calls a table is a table at any size or shape,
+/// and bars, stages and dance floors are recognized when the diagram names them, or for a
+/// dance floor, when it's drawn as a tiled floor. Unnamed shapes are tables when they are a
+/// plausible table size and aren't chairs around a table or an area enclosing other tables.
 public enum DiagramLayoutBuilder {
-    /// Plausible table sizes, in feet.
-    static let roundDiameter = 2.5...8.0
-    static let banquetLength = 3.5...16.0
-    static let banquetWidth = 1.5...4.0
+    /// Sizes, in feet, for shapes the diagram doesn't name. Wide on purpose: they only keep out
+    /// chairs, line work and whole areas. Round tables:
+    static let roundDiameter = 2.0...10.0
+    /// Long tables (one side at least 1.6 times the other), down to 18 in classroom tables:
+    static let longLength = 3.5...24.0
+    static let longWidth = 1.25...8.0
+    /// Square and near-square tables:
+    static let squareSide = 2.0...12.0
+    /// Below this a square is as likely a chair, column or speaker, so it counts only when it
+    /// carries a number or name.
+    static let labelOnlySide = 2.75
+    /// Smallest shape that a "table" label can make a table, so the inside of a letter isn't one.
+    static let namedMinimum = 1.0
 
-    public static func items(from reading: DiagramReading, calibration: DiagramCalibration) -> [LayoutItem] {
-        itemsAndGuesses(from: reading, calibration: calibration).items
+    enum Name { case table, bar, stage, danceFloor }
+
+    /// What a piece of text calls the object it's on. Whole words only, so "Barn" isn't a bar.
+    static func name(of text: String) -> Name? {
+        let words = text.lowercased().split { !$0.isLetter }.map(String.init)
+        if words.contains(where: isTableWord) { return .table }
+        if words.contains(where: { $0 == "dance" || $0 == "dancefloor" }) { return .danceFloor }
+        if words.contains(where: { $0 == "stage" || $0 == "riser" || $0 == "risers" }) { return .stage }
+        if words.contains(where: { $0 == "bar" || $0 == "bars" }) { return .bar }
+        return nil
+    }
+
+    /// "table", "tables", "tbl", or "table" misread by one letter ("tabie", "tabl").
+    static func isTableWord(_ word: String) -> Bool {
+        if word == "tables" || word == "tbl" { return true }
+        guard word.count >= 4, word.count <= 6 else { return false }
+        let target = Array("table")
+        var prev = Array(0...target.count)
+        for (i, ch) in word.enumerated() {
+            var cur = [i + 1]
+            for (j, t) in target.enumerated() {
+                cur.append(min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (ch == t ? 0 : 1)))
+            }
+            prev = cur
+        }
+        return prev[target.count] <= 1
+    }
+
+    /// "Table 7", "TABLE 7" and "Table #7" give "7", matching diagrams that write just the
+    /// number. "Gift table" and "Table" alone stay as they are.
+    static func tableNumber(_ s: String) -> String {
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        let word = trimmed.prefix { $0.isLetter }
+        guard isTableWord(word.lowercased()) else { return trimmed }
+        let rest = trimmed.dropFirst(word.count).trimmingCharacters(in: CharacterSet(charactersIn: " #:-."))
+        return rest.isEmpty ? trimmed : rest
+    }
+
+    /// A shape in feet, with what the diagram calls it.
+    struct Candidate {
+        var kind: DiagramShape.Kind
+        var footprint: Footprint
+        var name: Name?
+        var nameText: String?
+        /// Small and square: a table only if it carries a number or name.
+        var needsLabel = false
+        var area: Double { footprint.length * footprint.width }
+        var roundish: Bool { kind == .circle || (kind == .ellipse && footprint.length / footprint.width < 1.12) }
+    }
+
+    public static func items(from reading: DiagramReading, calibration: DiagramCalibration, includeUnlabeledSmall: Bool = false) -> [LayoutItem] {
+        itemsAndGuesses(from: reading, calibration: calibration, includeUnlabeledSmall: includeUnlabeledSmall).items
     }
 
     /// Items, plus the ids of tables whose numbers couldn't be read and were filled in.
-    public static func itemsAndGuesses(from reading: DiagramReading, calibration: DiagramCalibration) -> (items: [LayoutItem], guessed: Set<String>) {
+    /// `includeUnlabeledSmall` keeps small squares that have no number yet, so their numbers can be read.
+    public static func itemsAndGuesses(from reading: DiagramReading, calibration: DiagramCalibration,
+                                       includeUnlabeledSmall: Bool = false) -> (items: [LayoutItem], guessed: Set<String>) {
         let fpp = calibration.feetPerPixel
         let room = calibration.room
+        let roomSpan = max(room.widthFt, room.depthFt)
 
-        // Shapes in feet, sized like tables, inside the room.
-        var found: [(kind: ItemType, footprint: Footprint)] = []
-        for s in reading.shapes {
+        // Every shape inside the room, in feet. A slightly oval round is still a round;
+        // straightening leaves a little error.
+        var candidates: [Candidate] = reading.shapes.compactMap { s in
             let center = calibration.plan(s.center)
-            guard room.contains(center) else { continue }
+            guard room.contains(center) else { return nil }
             let length = s.length * fpp, width = s.width * fpp
-            // A slightly oval round is still a round; straightening leaves a little error.
-            let roundish = s.kind == .circle || (s.kind == .ellipse && length / width < 1.12)
-            if roundish {
+            guard length < roomSpan * 0.9, width > 0.25 else { return nil }
+            var c = Candidate(kind: s.kind, footprint: Footprint(center: center, length: length, width: width, rotationDegrees: s.rotationDegrees))
+            if c.roundish {
                 let d = (length + width) / 2
-                if roundDiameter.contains(d) {
-                    found.append((.roundTable, Footprint(center: center, length: d, width: d, rotationDegrees: 0)))
-                }
-                continue
+                c.footprint = Footprint(center: center, length: d, width: d, rotationDegrees: 0)
             }
-            switch s.kind {
-            case .circle where roundDiameter.contains(length):
-                found.append((.roundTable, Footprint(center: center, length: length, width: length, rotationDegrees: 0)))
-            case .rectangle where banquetLength.contains(length) && banquetWidth.contains(width) && length / width >= 1.6:
-                found.append((.banquetTable, Footprint(center: center, length: length, width: width, rotationDegrees: s.rotationDegrees)))
-            default:
-                break
+            return c
+        }
+
+        // Names on the diagram go to the smallest shape they sit inside, or when written beside
+        // an object, the largest one within a foot (the object, not a stool or chair next to it).
+        // The letters themselves run together into a shape the size of the text; that isn't it.
+        for t in reading.texts {
+            guard let n = name(of: t.text) else { continue }
+            let p = calibration.plan(t.center)
+            let textArea = t.width * t.height * fpp * fpp
+            let sized = candidates.indices.filter {
+                min(candidates[$0].footprint.length, candidates[$0].footprint.width) >= namedMinimum && candidates[$0].area > textArea * 1.5
+            }
+            // A measured round or rectangle before a fragment of one cut up by the text.
+            let inside = sized.filter { candidates[$0].footprint.contains(p) }
+            let target = inside.min { (candidates[$0].kind == .other ? 1 : 0, candidates[$0].area) < (candidates[$1].kind == .other ? 1 : 0, candidates[$1].area) }
+                ?? sized.filter { candidates[$0].footprint.inflated(by: 1).contains(p) }.max { candidates[$0].area < candidates[$1].area }
+            if let i = target, candidates[i].name == nil {
+                candidates[i].name = n
+                candidates[i].nameText = t.text.trimmingCharacters(in: .whitespaces)
             }
         }
 
-        // Stages and bars are only recognized when the diagram names them, since their sizes vary too much.
+        var used = Set<Int>()
         var named: [(ItemType, String, Footprint)] = []
-        for s in reading.shapes where s.kind == .rectangle {
-            let center = calibration.plan(s.center)
-            guard room.contains(center) else { continue }
-            let f = Footprint(center: center, length: s.length * fpp, width: s.width * fpp, rotationDegrees: s.rotationDegrees)
-            guard f.length < room.widthFt * 0.9, f.width > 1 else { continue }
-            let words = reading.texts.filter { f.inflated(by: 1).contains(calibration.plan($0.center)) }.map(\.text)
-            for w in words {
-                let lower = w.lowercased()
-                if lower.contains("stage") { named.append((.stage, w, f)); break }
-                if lower.contains("bar") { named.append((.bar, w, f)); break }
-                if lower.contains("dance") { named.append((.danceFloor, w, f)); break }
+
+        // A dance floor drawn as tiles: nine or more matching squares packed edge to edge.
+        // Tables are never packed like that, so the tiles aren't tables.
+        for grid in tileGrids(candidates) {
+            grid.cells.forEach { used.insert($0) }
+            if let c = grid.container { used.insert(c) }
+            let label = candidates.first { $0.name == .danceFloor && grid.footprint.contains($0.footprint.center) }?.nameText
+            named.append((.danceFloor, label ?? "Dance floor", grid.footprint))
+        }
+
+        // Bars, stages and dance floors the diagram names, whatever their shape.
+        for (i, c) in candidates.enumerated() where !used.contains(i) {
+            let type: ItemType
+            switch c.name {
+            case .bar: type = .bar
+            case .stage: type = .stage
+            case .danceFloor: type = .danceFloor
+            default: continue
+            }
+            guard min(c.footprint.length, c.footprint.width) >= namedMinimum else { continue }
+            used.insert(i)
+            named.append((type, c.nameText ?? "", c.footprint))
+        }
+        var keptNamed: [(ItemType, String, Footprint)] = []
+        for n in named.sorted(by: { $0.2.length * $0.2.width > $1.2.length * $1.2.width })
+            where !keptNamed.contains(where: { $0.2.contains(n.2.center) }) {
+            keptNamed.append(n)
+        }
+
+        // Tables: named ones at any size, unnamed ones within table sizes.
+        var tables: [Candidate] = []
+        for (i, var c) in candidates.enumerated() where !used.contains(i) {
+            // A named piece wins over a table guess on the same spot.
+            guard !keptNamed.contains(where: { $0.2.contains(c.footprint.center) }) else { continue }
+            let f = c.footprint
+            if c.name == .table {
+                guard min(f.length, f.width) >= namedMinimum else { continue }
+            } else if c.kind == .other {
+                continue
+            } else if c.roundish {
+                guard roundDiameter.contains(f.length) else { continue }
+                c.needsLabel = f.length < labelOnlySide
+            } else if f.length / f.width >= 1.6 {
+                guard longLength.contains(f.length), longWidth.contains(f.width) else { continue }
+            } else {
+                guard squareSide.contains(f.length), squareSide.contains(f.width) else { continue }
+                c.needsLabel = f.width < labelOnlySide
+            }
+            tables.append(c)
+        }
+
+        // Chairs: small unnamed shapes hugging the outside of a bigger table.
+        let beforeChairs = tables
+        tables.removeAll { t in
+            guard t.name == nil else { return false }
+            let size = t.footprint.length
+            return beforeChairs.contains { b in
+                b.footprint.width > size * 1.3 && !b.footprint.contains(t.footprint.center)
+                    && b.footprint.inflated(by: size * 0.75 + 0.25).contains(t.footprint.center)
             }
         }
-        // A named piece wins over a table guess on the same spot.
-        found.removeAll { f in named.contains { $0.2.contains(f.footprint.center) } }
+        // An outline around other, much smaller tables is an area, not a table. Shapes found
+        // twice (inside and outside a drawn line) sit on the same center at nearly the same size,
+        // and pieces of a table cut up by its label are too big to count.
+        func sameSpot(_ a: Candidate, _ b: Candidate) -> Bool {
+            a.footprint.center.distance(to: b.footprint.center) < min(a.footprint.width, b.footprint.width) * 0.25
+                && min(a.area, b.area) / max(a.area, b.area) > 0.5
+        }
+        let all = tables
+        tables.removeAll { a in
+            let inside = all.filter { o in !sameSpot(a, o) && o.area < a.area * 0.35 && a.footprint.contains(o.footprint.center) }
+            // An irregular outline gives way to a measured round or rectangle inside it.
+            if a.kind == .other { return inside.contains { $0.kind != .other } }
+            return inside.count >= 2
+        }
 
         // A drawn outline traces twice, once on each side of the line. Keep the outer one.
-        found.sort { $0.footprint.length * $0.footprint.width > $1.footprint.length * $1.footprint.width }
-        var kept: [(kind: ItemType, footprint: Footprint)] = []
-        for f in found where !kept.contains(where: { $0.footprint.contains(f.footprint.center) }) {
-            kept.append(f)
+        tables.sort { $0.area > $1.area }
+        var kept: [Candidate] = []
+        for t in tables where !kept.contains(where: { $0.footprint.contains(t.footprint.center) }) {
+            kept.append(t)
         }
         // Reading order: top to bottom in rows, then left to right.
         kept.sort {
@@ -281,20 +425,28 @@ public enum DiagramLayoutBuilder {
             return $0.footprint.center.x < $1.footprint.center.x
         }
 
-        // Labels: short text sitting on or right next to the table.
-        let texts = reading.texts.compactMap { t -> (String, PlanPoint)? in
-            let s = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Labels: short text sitting on or right next to the table. Text that says "Table 12"
+        // outright beats a bare number read nearer the middle.
+        let texts = reading.texts.compactMap { t -> (String, PlanPoint, Int)? in
+            let raw = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let s = tableNumber(raw)
             guard isPlausibleLabel(s) else { return nil }
-            return (s, calibration.plan(t.center))
+            return (s, calibration.plan(t.center), s == raw ? 1 : 0)
         }
         var usedLabels = Set<String>()
         var labels: [String?] = kept.map { k in
             let near = texts
                 .filter { k.footprint.inflated(by: 1).contains($0.1) }
-                .min { $0.1.distance(to: k.footprint.center) < $1.1.distance(to: k.footprint.center) }
+                .min { ($0.2, $0.1.distance(to: k.footprint.center)) < ($1.2, $1.1.distance(to: k.footprint.center)) }
             guard let label = near?.0, !usedLabels.contains(label) else { return nil }
             usedLabels.insert(label)
             return label
+        }
+        // Small squares with nothing written on them are left out.
+        if !includeUnlabeledSmall {
+            let keep = kept.indices.filter { !kept[$0].needsLabel || labels[$0] != nil }
+            kept = keep.map { kept[$0] }
+            labels = keep.map { labels[$0] }
         }
         // Tables without a readable number get the next free numbers.
         var next = (usedLabels.compactMap(Int.init).filter { $0 <= 999 }.max() ?? 0) + 1
@@ -307,11 +459,6 @@ public enum DiagramLayoutBuilder {
 
         var ids = Set<String>()
         var pieces: [LayoutItem] = []
-        var keptNamed: [(ItemType, String, Footprint)] = []
-        for n in named.sorted(by: { $0.2.length * $0.2.width > $1.2.length * $1.2.width })
-            where !keptNamed.contains(where: { $0.2.contains(n.2.center) }) {
-            keptNamed.append(n)
-        }
         for (type, word, f) in keptNamed {
             let base = type == .stage ? "STAGE" : (type == .bar ? "BAR" : "DANCE")
             var id = base
@@ -323,31 +470,111 @@ public enum DiagramLayoutBuilder {
                                      rotation: f.rotationDegrees.rounded()))
         }
         var guessedIDs = Set<String>()
-        let tables = kept.enumerated().map { i, k -> LayoutItem in
+        let items = kept.enumerated().map { i, k -> LayoutItem in
             let label = labels[i] ?? String(i + 1)
             var id = "T\(label)".replacingOccurrences(of: " ", with: "-")
             if ids.contains(id) { id += "-\(i + 1)" }
             ids.insert(id)
             let f = k.footprint
-            if k.kind == .roundTable {
+            if k.roundish {
                 let d = (f.length * 2).rounded() / 2
                 return LayoutItem(id: id, type: .roundTable, label: label, x: f.center.x, y: f.center.y,
                                   diameterFt: d, seats: defaultSeats(.roundTable, length: d))
             }
             let l = (f.length * 2).rounded() / 2, w = (f.width * 2).rounded() / 2
-            // A table-sized piece named on the diagram as a bar is a bar.
-            let lower = label.lowercased()
-            if lower.contains("bar") || lower.contains("stage") {
-                let type: ItemType = lower.contains("bar") ? .bar : .stage
-                return LayoutItem(id: id, type: type, label: label, x: f.center.x, y: f.center.y,
+            if k.kind == .ellipse {
+                return LayoutItem(id: id, type: .ovalTable, label: label, x: f.center.x, y: f.center.y,
+                                  lengthFt: l, widthFt: w, rotation: f.rotationDegrees.rounded(),
+                                  seats: defaultSeats(.ovalTable, length: l, width: w))
+            }
+            // Other shapes named as tables are kept by their outer size, as banquet tables.
+            // A table-sized piece named on the diagram as a bar or stage is one.
+            if let n = name(of: label), n == .bar || n == .stage {
+                return LayoutItem(id: id, type: n == .bar ? .bar : .stage, label: label, x: f.center.x, y: f.center.y,
                                   lengthFt: l, widthFt: w, rotation: f.rotationDegrees.rounded())
             }
             return LayoutItem(id: id, type: .banquetTable, label: label, x: f.center.x, y: f.center.y,
                               lengthFt: l, widthFt: w, rotation: f.rotationDegrees.rounded(),
-                              seats: defaultSeats(.banquetTable, length: l))
+                              seats: defaultSeats(.banquetTable, length: l, width: w))
         }
-        for (i, item) in tables.enumerated() where guessedIndices.contains(i) { guessedIDs.insert(item.id) }
-        return (pieces + tables, guessedIDs)
+        for (i, item) in items.enumerated() where guessedIndices.contains(i) { guessedIDs.insert(item.id) }
+        return (pieces + items, guessedIDs)
+    }
+
+    struct TileGrid {
+        var cells: [Int]
+        /// An outline drawn around the tiles, which is the floor's true edge.
+        var container: Int?
+        var footprint: Footprint
+    }
+
+    /// Groups of six or more matching squares at least 2 ft across, turned the same way and
+    /// packed edge to edge or corner to corner (a checkerboard), spanning three rows and columns.
+    /// Six, not nine, because a label written across the floor hides some tiles.
+    static func tileGrids(_ candidates: [Candidate]) -> [TileGrid] {
+        let cells = candidates.indices.filter { i in
+            let c = candidates[i]
+            return c.kind == .rectangle && c.name != .table && c.footprint.length / c.footprint.width < 1.25 && c.footprint.width >= 2
+        }
+        func turn(_ c: Candidate) -> Double { c.footprint.rotationDegrees.truncatingRemainder(dividingBy: 90) }
+        var parent = Dictionary(uniqueKeysWithValues: cells.map { ($0, $0) })
+        func find(_ a: Int) -> Int { var a = a; while parent[a]! != a { a = parent[a]! }; return a }
+        for (n, i) in cells.enumerated() {
+            for j in cells[(n + 1)...] {
+                let a = candidates[i], b = candidates[j]
+                let size = (a.footprint.length + b.footprint.length) / 2
+                var dt = abs(turn(a) - turn(b)); dt = min(dt, 90 - dt)
+                guard abs(a.footprint.length - b.footprint.length) < size * 0.12, dt < 5,
+                      a.footprint.center.distance(to: b.footprint.center) < size * 1.5 else { continue }
+                let ra = find(i), rb = find(j)
+                if ra != rb { parent[max(ra, rb)] = min(ra, rb) }
+            }
+        }
+        let groups = Dictionary(grouping: cells, by: find).values.filter { $0.count >= 6 }
+        return groups.compactMap { group in
+            let angle = turn(candidates[group[0]])
+            let size = group.map { candidates[$0].footprint.length }.reduce(0, +) / Double(group.count)
+            // Lay the tiles out in their own frame to count rows and columns and find the edges.
+            let local = group.map { candidates[$0].footprint.center.rotated(degrees: -angle) }
+            let rows = Set(local.map { Int(($0.y / size).rounded()) }), cols = Set(local.map { Int(($0.x / size).rounded()) })
+            guard rows.count >= 3, cols.count >= 3 else { return nil }
+            let half = size / 2
+            let x0 = local.map(\.x).min()! - half, x1 = local.map(\.x).max()! + half
+            let y0 = local.map(\.y).min()! - half, y1 = local.map(\.y).max()! + half
+            let center = PlanPoint(x: (x0 + x1) / 2, y: (y0 + y1) / 2).rotated(degrees: angle)
+            var footprint = Footprint(center: center, length: x1 - x0, width: y1 - y0, rotationDegrees: angle)
+            if footprint.width > footprint.length {
+                footprint = Footprint(center: center, length: y1 - y0, width: x1 - x0, rotationDegrees: angle + 90)
+            }
+            // A drawn outline around the tiles is the floor's edge. It can be well bigger than the
+            // tiles found, when edge tiles run into it or a label hides some.
+            let area = footprint.length * footprint.width
+            let container = candidates.indices.filter { i in
+                !group.contains(i) && candidates[i].kind == .rectangle && candidates[i].footprint.contains(center)
+                    && candidates[i].area >= area * 0.95 && candidates[i].area <= area * 3
+            }.max { candidates[$0].area < candidates[$1].area }
+            return TileGrid(cells: group, container: container, footprint: container.map { candidates[$0].footprint } ?? footprint)
+        }
+    }
+
+    /// Words on the diagram naming a table, bar, stage or dance floor that no item was found
+    /// under, so the person knows to add it.
+    public static func namedWithoutOutline(_ texts: [DiagramText], items: [LayoutItem], calibration: DiagramCalibration) -> [String] {
+        var out: [String] = []
+        for t in texts {
+            let s = t.text.trimmingCharacters(in: .whitespaces)
+            guard name(of: s) != nil, !out.contains(s) else { continue }
+            let p = calibration.plan(t.center)
+            guard calibration.room.contains(p) else { continue }
+            if !items.contains(where: { $0.footprint.inflated(by: 1.5).contains(p) }) { out.append(s) }
+        }
+        return out
+    }
+
+    /// Text that names or numbers something, as opposed to chairs or line work read as text.
+    public static func isLabelOrName(_ s: String) -> Bool {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isPlausibleLabel(tableNumber(trimmed))
     }
 
     /// Table numbers run 1 to 999 without leading zeros; names are words. Anything else is
@@ -362,16 +589,28 @@ public enum DiagramLayoutBuilder {
         guard s.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return false }
         let letters = s.filter(\.isLetter)
         guard letters.count >= 2 else { return false }
-        // "oo oo do oo": mostly round letters is a row of chairs, not a word.
-        let round = letters.lowercased().filter { "o0".contains($0) }.count
-        return Double(round) / Double(letters.count) < 0.5
+        // "oo oo do oo": mostly round letters is a row of chairs, not a word. Chairs seen side
+        // on or with backs read as "UU", "nnna" or "JU".
+        let lower = letters.lowercased()
+        let round = lower.filter { "o0".contains($0) }.count
+        let chairLike = lower.filter { "o0uncjdq".contains($0) }.count
+        return Double(round) / Double(letters.count) < 0.5 && Double(chairLike) / Double(letters.count) < 0.75
     }
 
-    /// Common seating: 60 in rounds seat 8, 72 in rounds seat 10, banquet tables about one per foot.
-    public static func defaultSeats(_ type: ItemType, length: Double) -> Int {
+    /// Common seating: 60 in rounds seat 8, 72 in rounds seat 10, banquet tables about one per
+    /// foot, square tables one or two a side, ovals one per 2 ft of edge.
+    public static func defaultSeats(_ type: ItemType, length: Double, width: Double? = nil) -> Int {
         switch type {
         case .roundTable: return length >= 5.75 ? 10 : 8
-        case .banquetTable: return max(2, Int(length.rounded(.down)))
+        case .ovalTable:
+            // Edge length of the ellipse (Ramanujan's approximation).
+            let a = length / 2, b = (width ?? length * 0.5) / 2
+            let h = ((a - b) * (a - b)) / ((a + b) * (a + b))
+            let edge = Double.pi * (a + b) * (1 + 3 * h / (10 + (4 - 3 * h).squareRoot()))
+            return max(4, Int((edge / 2).rounded(.down)))
+        case .banquetTable:
+            if let width, width >= length * 0.8 { return length >= 4.5 ? 8 : (length >= 2.5 ? 4 : 2) }
+            return max(2, Int(length.rounded(.down)))
         default: return 0
         }
     }

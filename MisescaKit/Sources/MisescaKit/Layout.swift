@@ -67,6 +67,7 @@ public struct EventLayout: Codable, Hashable, Sendable {
         LayoutCounts(
             rounds: items.filter { $0.type == .roundTable }.count,
             banquetTables: items.filter { $0.type == .banquetTable }.count,
+            ovalTables: items.filter { $0.type == .ovalTable }.count,
             stages: items.filter { $0.type == .stage }.count,
             bars: items.filter { $0.type == .bar }.count,
             danceFloors: items.filter { $0.type == .danceFloor }.count,
@@ -80,6 +81,7 @@ public struct EventLayout: Codable, Hashable, Sendable {
 public struct LayoutCounts: Hashable, Sendable {
     public var rounds: Int
     public var banquetTables: Int
+    public var ovalTables: Int
     public var stages: Int
     public var bars: Int
     public var danceFloors: Int
@@ -162,11 +164,15 @@ public struct ReferencePoint: Codable, Hashable, Sendable {
 public enum ItemType: String, Codable, CaseIterable, Sendable {
     case roundTable = "round_table"
     case banquetTable = "banquet_table"
+    /// An oval or racetrack table, sized by its length and width.
+    case ovalTable = "oval_table"
     case stage
     case bar
     case danceFloor = "dance_floor"
 
-    public var isTable: Bool { self == .roundTable || self == .banquetTable }
+    public var isTable: Bool { self == .roundTable || self == .banquetTable || self == .ovalTable }
+    /// Drawn and built with a curved outline: rounds, and ovals inside their length and width.
+    public var isCurved: Bool { self == .roundTable || self == .ovalTable }
 }
 
 public struct LayoutItem: Codable, Hashable, Identifiable, Sendable {
@@ -226,7 +232,7 @@ public struct LayoutItem: Codable, Hashable, Identifiable, Sendable {
             return label
         }
         switch type {
-        case .roundTable, .banquetTable: return "Table \(id)"
+        case .roundTable, .banquetTable, .ovalTable: return "Table \(id)"
         case .stage: return "Stage"
         case .bar: return "Bar"
         case .danceFloor: return "Dance floor"

@@ -80,7 +80,7 @@ public enum LayoutLoader {
             case .roundTable:
                 guard let d = item.diameterFt, d > 0 else { try fail("\(name) is a round table and needs diameter_ft.") }
                 if d > 20 { try fail("\(name) is \(Int(d)) ft across. Check diameter_ft.") }
-            case .banquetTable, .stage, .bar, .danceFloor:
+            case .banquetTable, .ovalTable, .stage, .bar, .danceFloor:
                 guard let l = item.lengthFt, l > 0, let w = item.widthFt, w > 0 else {
                     try fail("\(name) needs length_ft and width_ft.")
                 }
@@ -120,7 +120,7 @@ public enum LayoutLoader {
             let p = path(ctx.codingPath)
             if p.isEmpty { return "This isn't a Misesca layout file. Layout files end in .json, like the samples." }
             if ctx.codingPath.last?.stringValue == "type" {
-                return "\(p) isn't a known item type. Use round_table, banquet_table, stage, bar or dance_floor."
+                return "\(p) isn't a known item type. Use round_table, banquet_table, oval_table, stage, bar or dance_floor."
             }
             return "\(p) can't be read. \(ctx.debugDescription)"
         @unknown default:

@@ -236,7 +236,7 @@ private struct TableEditor: View {
     @Bindable var model: DiagramImportModel
 
     private let types: [(ItemType, String)] = [
-        (.roundTable, "Round"), (.banquetTable, "Banquet"), (.stage, "Stage"), (.bar, "Bar"), (.danceFloor, "Dance floor")
+        (.roundTable, "Round"), (.banquetTable, "Banquet"), (.ovalTable, "Oval"), (.stage, "Stage"), (.bar, "Bar"), (.danceFloor, "Dance floor")
     ]
 
     var body: some View {
@@ -281,11 +281,15 @@ private struct TableEditor: View {
                 } else {
                     SizeStepper(title: "Length", value: item.lengthFt ?? 6, range: 2...60) { v in
                         var i = item; i.lengthFt = v
-                        if i.type == .banquetTable { i.seats = DiagramLayoutBuilder.defaultSeats(.banquetTable, length: v) }
+                        if i.type == .banquetTable || i.type == .ovalTable {
+                            i.seats = DiagramLayoutBuilder.defaultSeats(i.type, length: v, width: i.widthFt)
+                        }
                         model.selected = i
                     }
                     SizeStepper(title: "Width", value: item.widthFt ?? 2.5, range: 1...40) { v in
-                        var i = item; i.widthFt = v; model.selected = i
+                        var i = item; i.widthFt = v
+                        if i.type == .ovalTable { i.seats = DiagramLayoutBuilder.defaultSeats(.ovalTable, length: i.lengthFt ?? v, width: v) }
+                        model.selected = i
                     }
                     Stepper(value: Binding(get: { item.rotation ?? 0 }, set: { v in
                         var i = item; i.rotation = (v.truncatingRemainder(dividingBy: 180) + 180).truncatingRemainder(dividingBy: 180)
@@ -520,6 +524,13 @@ private struct DiagramCanvas: View {
             if item.type == .roundTable {
                 let c = px(f.center), r = px(PlanPoint(x: f.length / 2, y: 0)).x - px(PlanPoint(x: 0, y: 0)).x
                 path.addEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
+            } else if item.type == .ovalTable {
+                // The ellipse inside the turned footprint, traced through its corners' frame.
+                let c = px(f.center), scale = px(PlanPoint(x: 1, y: 0)).x - px(PlanPoint(x: 0, y: 0)).x
+                let rx = f.length / 2 * scale, ry = f.width / 2 * scale
+                path.addPath(Path(ellipseIn: CGRect(x: -rx, y: -ry, width: 2 * rx, height: 2 * ry))
+                    .applying(CGAffineTransform(rotationAngle: f.rotationDegrees * .pi / 180)
+                        .concatenating(CGAffineTransform(translationX: c.x, y: c.y))))
             } else {
                 path.addLines(f.corners.map(px))
                 path.closeSubpath()

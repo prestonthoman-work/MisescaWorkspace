@@ -26,7 +26,7 @@ struct PlanCanvasView: View {
 
     private var accessibilitySummary: String {
         let c = layout.counts
-        var s = "Plan of \(layout.event.room), \(Int(layout.room.widthFt)) by \(Int(layout.room.depthFt)) feet. \(c.rounds) rounds, \(c.banquetTables) banquet tables."
+        var s = "Plan of \(layout.event.room), \(Int(layout.room.widthFt)) by \(Int(layout.room.depthFt)) feet. \(c.rounds) rounds, \(c.banquetTables) banquet tables\(c.ovalTables > 0 ? ", \(c.ovalTables) oval tables" : "")."
         if let report { s += " Check result: \(report.summary)" }
         else if !placed.isEmpty { s += " \(placed.count) of \(layout.items.count) en place." }
         return s
@@ -66,7 +66,7 @@ struct PlanCanvasView: View {
         // Non-table pieces first so tables sit on top.
         let ordered = layout.items.sorted { ($0.type.isTable ? 1 : 0) < ($1.type.isTable ? 1 : 0) }
         for item in ordered {
-            let shape = itemPath(item.footprint, round: item.type == .roundTable, pt)
+            let shape = itemPath(item.footprint, round: item.type.isCurved, pt)
             let style = self.style(for: item)
             if let fill = style.fill { ctx.fill(shape, with: .color(fill)) }
             ctx.stroke(shape, with: .color(style.stroke), style: StrokeStyle(lineWidth: style.lineWidth, dash: style.dash))
@@ -75,7 +75,7 @@ struct PlanCanvasView: View {
                 // Where the real table is: dashed outline and a line back to its plan spot.
                 var moved = item.footprint
                 moved.center = moved.center + offset
-                ctx.stroke(itemPath(moved, round: item.type == .roundTable, pt), with: .color(Palette.terracotta),
+                ctx.stroke(itemPath(moved, round: item.type.isCurved, pt), with: .color(Palette.terracotta),
                            style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
                 var link = Path()
                 link.move(to: pt(item.center))
@@ -84,7 +84,7 @@ struct PlanCanvasView: View {
             }
 
             if highlight == .table(item.id) {
-                ctx.stroke(itemPath(item.footprint.inflated(by: 1.2), round: item.type == .roundTable, pt),
+                ctx.stroke(itemPath(item.footprint.inflated(by: 1.2), round: item.type.isCurved, pt),
                            with: .color(Palette.terracotta), lineWidth: 2.5)
             }
 
@@ -163,11 +163,14 @@ struct PlanCanvasView: View {
         return p
     }
 
+    /// Rounds and ovals as the ellipse inside their footprint, turned with it; everything else as its rectangle.
     private func itemPath(_ f: Footprint, round: Bool, _ pt: (PlanPoint) -> CGPoint) -> Path {
         guard round else { return polygon(f, pt) }
         let c = pt(f.center)
-        let r = pt(PlanPoint(x: f.length / 2, y: 0)).x
-        return Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
+        let rx = pt(PlanPoint(x: f.length / 2, y: 0)).x, ry = pt(PlanPoint(x: f.width / 2, y: 0)).x
+        let ellipse = Path(ellipseIn: CGRect(x: -rx, y: -ry, width: 2 * rx, height: 2 * ry))
+        return ellipse.applying(CGAffineTransform(rotationAngle: f.rotationDegrees * .pi / 180)
+            .concatenating(CGAffineTransform(translationX: c.x, y: c.y)))
     }
 }
 

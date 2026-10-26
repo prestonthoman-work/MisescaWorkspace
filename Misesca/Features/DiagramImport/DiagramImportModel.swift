@@ -198,13 +198,18 @@ final class DiagramImportModel {
             item.lengthFt = nil
             item.widthFt = nil
             item.rotation = nil
+        case .ovalTable:
+            item.diameterFt = nil
+            item.lengthFt = max(size.length, 4)
+            item.widthFt = min(max(size.width, 2.5), item.lengthFt!)
+            item.rotation = item.rotation ?? 0
         default:
             item.diameterFt = nil
             item.lengthFt = type == .banquetTable ? max(size.length, 6) : max(size.length, 8)
             item.widthFt = type == .banquetTable ? 2.5 : max(size.width, 3)
             item.rotation = item.rotation ?? 0
         }
-        item.seats = DiagramLayoutBuilder.defaultSeats(type, length: item.size.length)
+        item.seats = DiagramLayoutBuilder.defaultSeats(type, length: item.size.length, width: item.size.width)
         selected = item
     }
 
@@ -238,7 +243,7 @@ final class DiagramImportModel {
             var copy = item
             let base: String
             switch item.type {
-            case .roundTable, .banquetTable:
+            case .roundTable, .banquetTable, .ovalTable:
                 base = "T" + (item.label ?? "").filter { $0.isLetter || $0.isNumber }
             case .stage: base = "STAGE"
             case .bar: base = "BAR"

@@ -6,41 +6,100 @@ import Vision
 /// Finds table shapes and text in a diagram image, on device.
 public enum DiagramReader {
     public static func read(_ image: CGImage) throws -> DiagramReading {
-        let w = Double(image.width), h = Double(image.height)
-        let text = VNRecognizeTextRequest()
-        text.recognitionLevel = .accurate
-        text.usesLanguageCorrection = false
-        text.minimumTextHeight = 0.005
-        try VNImageRequestHandler(cgImage: image, options: [:]).perform([text])
+        DiagramReading(imageWidth: Double(image.width), imageHeight: Double(image.height),
+                       shapes: RegionTracer.shapes(in: image), texts: try readText(image))
+    }
 
-        let texts: [DiagramText] = (text.results ?? []).compactMap { obs in
+    /// Longest side of each piece the page is cut into for reading text.
+    static let textTile = 1400.0
+
+    /// Text across the whole page, then again piece by piece. The reader shrinks a big page
+    /// before reading it, which loses small labels like "Table 7" or "BAR"; a piece keeps them.
+    public static func readText(_ image: CGImage) throws -> [DiagramText] {
+        let w = Double(image.width), h = Double(image.height)
+        var texts = try recognizeAll(image, in: CGRect(x: 0, y: 0, width: w, height: h), full: CGSize(width: w, height: h))
+        let n = Int((max(w, h) / textTile).rounded(.up))
+        guard n >= 2 else { return texts }
+        let tw = w / Double(n), th = h / Double(n)
+        // Overlap pieces so a label on a seam is whole in one of them.
+        let overlapX = tw * 0.15, overlapY = th * 0.15
+        for i in 0..<n {
+            for j in 0..<n {
+                let r = CGRect(x: max(0, Double(i) * tw - overlapX), y: max(0, Double(j) * th - overlapY),
+                               width: min(w, Double(i + 1) * tw + overlapX) - max(0, Double(i) * tw - overlapX),
+                               height: min(h, Double(j + 1) * th + overlapY) - max(0, Double(j) * th - overlapY)).integral
+                for t in try recognizeAll(image, in: r, full: CGSize(width: w, height: h)) {
+                    let key = t.text.lowercased().filter { !$0.isWhitespace }
+                    let duplicate = texts.contains {
+                        $0.center.distance(to: t.center) < max(w, h) * 0.01 && $0.text.lowercased().filter { !$0.isWhitespace } == key
+                    }
+                    if !duplicate { texts.append(t) }
+                }
+            }
+        }
+        return texts
+    }
+
+    /// Confident lines of text inside `rect` of the image, placed in whole-image pixels.
+    /// Lines cut by the edge of a piece are left for the piece that holds them whole.
+    static func recognizeAll(_ image: CGImage, in rect: CGRect, full: CGSize) throws -> [DiagramText] {
+        let isWhole = rect.width >= full.width && rect.height >= full.height
+        guard let piece = isWhole ? image : image.cropping(to: rect) else { return [] }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        request.minimumTextHeight = 0.005
+        try VNImageRequestHandler(cgImage: piece, options: [:]).perform([request])
+        let pw = Double(rect.width), ph = Double(rect.height)
+        return (request.results ?? []).compactMap { obs in
             // Rows of chairs can look like "oo oo" to a text reader; keep only confident reads.
             guard let top = obs.topCandidates(1).first, top.confidence >= 0.5 else { return nil }
-            let s = top.string
             let box = obs.boundingBox
-            return DiagramText(text: s, center: PlanPoint(x: Double(box.midX) * w, y: (1 - Double(box.midY)) * h))
+            if !isWhole {
+                let margin = 0.004
+                let cutX = (box.minX < margin && rect.minX > 0) || (box.maxX > 1 - margin && rect.maxX < full.width)
+                let cutY = (box.minY < margin && rect.maxY < full.height) || (box.maxY > 1 - margin && rect.minY > 0)
+                if cutX || cutY { return nil }
+            }
+            return DiagramText(text: top.string,
+                               center: PlanPoint(x: Double(rect.minX) + Double(box.midX) * pw,
+                                                 y: Double(rect.minY) + (1 - Double(box.midY)) * ph),
+                               width: Double(box.width) * pw, height: Double(box.height) * ph)
         }
-        return DiagramReading(imageWidth: w, imageHeight: h, shapes: RegionTracer.shapes(in: image), texts: texts)
     }
 
     /// Page-wide text reading skips lone numbers, which is what table labels usually are.
     /// Reading each table on its own, enlarged, picks them up.
-    public static func readLabels(at shapes: [DiagramShape], in image: CGImage) -> [DiagramText] {
-        var out: [DiagramText] = []
-        for shape in shapes {
+    /// `page` is the text already read across the page: where it spells out "Table 12" on a
+    /// table, that table's label is read as it stands. Tables are read in parallel.
+    public static func readLabels(at shapes: [DiagramShape], in image: CGImage, page: [DiagramText] = []) -> [DiagramText] {
+        let spelled = page.filter { DiagramLayoutBuilder.tableNumber($0.text) != $0.text.trimmingCharacters(in: .whitespaces) }
+        var results = [DiagramText?](repeating: nil, count: shapes.count)
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: shapes.count) { i in
+            let shape = shapes[i]
             // Only the inside of the table, turned level, so chairs and neighbors can't be read as a number.
             let inside: (Double, Double) = shape.kind == .circle
                 ? (shape.length * 0.7, shape.length * 0.7)
                 : (shape.length * 0.92, shape.width * 0.8)
             guard let patch = levelPatch(image, center: shape.center, length: inside.0, width: inside.1,
                                          rotationDegrees: shape.kind == .circle ? 0 : shape.rotationDegrees),
-                  let big = enlarged(patch, toHeight: 200) else { continue }
-            // Read after a known word first: a lone "9" on its own has no right way up and can read as "6".
-            if let string = recognizeSingle(big) ?? recognize(big, level: .accurate) {
-                out.append(DiagramText(text: string, center: shape.center))
-            }
+                  let big = enlarged(patch, toHeight: 200) else { return }
+            // A label that says "Table 12" or "Gift table" reads as it is: the page spelled it out,
+            // or its ink is wider than three digits. Otherwise read after a known word first: a lone
+            // "9" on its own has no right way up and can read as "6".
+            let box = Footprint(center: shape.center, length: shape.length, width: shape.width, rotationDegrees: shape.rotationDegrees)
+            let glyph = labelInk(big)
+            let wide = glyph.map { Double($0.width) > Double($0.height) * 2.6 } ?? false
+            let string = wide || spelled.contains(where: { box.contains($0.center) })
+                ? recognize(big, level: .accurate) ?? glyph.flatMap(recognizeSingle(glyph:))
+                : glyph.flatMap(recognizeSingle(glyph:)) ?? recognize(big, level: .accurate)
+            guard let string else { return }
+            lock.lock()
+            results[i] = DiagramText(text: string, center: shape.center)
+            lock.unlock()
         }
-        return out
+        return results.compactMap { $0 }
     }
 
     /// Cuts out an oriented rectangle of the image and turns it level. Text on a table turned
@@ -85,6 +144,11 @@ public enum DiagramReader {
     /// Text recognition skips a lone character such as "7" and can't tell "6" from an upside-down "9".
     /// Set after a known word it reads as a line, "Table 7", and the word is stripped off again.
     static func recognizeSingle(_ image: CGImage) -> String? {
+        labelInk(image).flatMap(recognizeSingle(glyph:))
+    }
+
+    /// Just the label's ink from a table patch, dark on white.
+    static func labelInk(_ image: CGImage) -> CGImage? {
         let w = Double(image.width), h = Double(image.height)
         // Trim the patch edge, then keep just the label's ink.
         let inner = CGRect(x: w * 0.1, y: h * 0.1, width: w * 0.8, height: h * 0.8).integral
@@ -93,7 +157,11 @@ public enum DiagramReader {
         // table top is white; a gray box around the pasted number confuses the reader.
         if meanBrightness(middle) < 110, let flipped = inverted(middle) { middle = flipped }
         if let clean = whitened(middle) { middle = clean }
-        guard let ink = inkBounds(middle), let glyph = middle.cropping(to: ink) else { return nil }
+        guard let ink = inkBounds(middle) else { return nil }
+        return middle.cropping(to: ink)
+    }
+
+    static func recognizeSingle(glyph: CGImage) -> String? {
 
         let capHeight = 60.0
         let font = CTFontCreateWithName("Helvetica-Bold" as CFString, capHeight / 0.72, nil)
@@ -128,18 +196,7 @@ public enum DiagramReader {
         let trimmed = s.trimmingCharacters(in: .whitespaces)
         let letters = trimmed.prefix { $0.isLetter }
         guard letters.count >= 4, letters.count <= 6 else { return nil }
-        let word = letters.lowercased()
-        let target = Array("table")
-        // Close enough to "table": at most one letter different, added or missing.
-        var prev = Array(0...target.count)
-        for (i, ch) in word.enumerated() {
-            var cur = [i + 1]
-            for (j, t) in target.enumerated() {
-                cur.append(min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (ch == t ? 0 : 1)))
-            }
-            prev = cur
-        }
-        guard prev[target.count] <= 1 else { return nil }
+        guard DiagramLayoutBuilder.isTableWord(letters.lowercased()) else { return nil }
         let rest = trimmed.dropFirst(letters.count).trimmingCharacters(in: .whitespaces)
         return rest.isEmpty ? nil : rest
     }

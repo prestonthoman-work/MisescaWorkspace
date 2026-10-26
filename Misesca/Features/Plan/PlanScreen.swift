@@ -157,6 +157,7 @@ struct CountsGrid: View {
         let rows: [(String, String)] = [
             ("Rounds", "\(c.rounds)"),
             ("Banquet tables", "\(c.banquetTables)"),
+            ("Oval tables", "\(c.ovalTables)"),
             ("Stage", "\(c.stages)"),
             ("Bar", "\(c.bars)"),
             ("Dance floor", "\(c.danceFloors)"),
