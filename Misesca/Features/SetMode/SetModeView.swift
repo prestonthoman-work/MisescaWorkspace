@@ -107,7 +107,13 @@ private struct SetModeContent: View {
                 .background(Palette.Fixed.ink.swiftUI.opacity(0.75), in: RoundedRectangle(cornerRadius: 8))
             Spacer()
             if session.isAligned, session.phase == .placing {
-                OverlayButton(systemImage: "scope", label: "Line up again", action: session.realign)
+                Menu {
+                    Button("Redo point B", action: session.redoPointB)
+                    Button("Redo both points", action: session.realign)
+                } label: {
+                    OverlayIcon(systemImage: "scope")
+                }
+                .accessibilityLabel("Line up again")
             } else {
                 Color.clear.frame(width: 48, height: 48)
             }
@@ -173,7 +179,8 @@ private struct SetModeContent: View {
         case .mismatch(let check):
             PanelTitle("Points don't match the plan")
             PanelText(check.message ?? "")
-            Button("Redo points", action: session.redoPoints).buttonStyle(PrimaryButtonStyle())
+            Button("Redo point B", action: session.redoPointB).buttonStyle(PrimaryButtonStyle())
+            Button("Redo both points", action: session.redoPoints).buttonStyle(SecondaryButtonStyle())
             Button("Use these points", action: session.acceptMismatch).buttonStyle(SecondaryButtonStyle())
 
         case .placing:
@@ -301,13 +308,21 @@ private struct OverlayButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(Palette.Fixed.linen.swiftUI)
-                .frame(width: 48, height: 48)
-                .background(Palette.Fixed.ink.swiftUI.opacity(0.75), in: Circle())
+            OverlayIcon(systemImage: systemImage)
         }
         .accessibilityLabel(label)
+    }
+}
+
+private struct OverlayIcon: View {
+    var systemImage: String
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(Palette.Fixed.linen.swiftUI)
+            .frame(width: 48, height: 48)
+            .background(Palette.Fixed.ink.swiftUI.opacity(0.75), in: Circle())
     }
 }
 

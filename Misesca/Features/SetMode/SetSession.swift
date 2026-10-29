@@ -230,6 +230,19 @@ final class SetSession: NSObject, ARSessionDelegate {
         hint = nil
     }
 
+    /// Keep point A and tap B again. Works after a mismatch or once the layout is up.
+    func redoPointB() {
+        guard let a = pointA else { realign(); return }
+        scanner.cancel()
+        removeGhosts()
+        alignment = nil
+        clearMarkers()
+        pendingAlignment = nil
+        addMarker("A", at: a)
+        phase = .tapB
+        hint = nil
+    }
+
     /// Start alignment over. Marks are kept; only the ghosts' position changes.
     func realign() {
         scanner.cancel()
